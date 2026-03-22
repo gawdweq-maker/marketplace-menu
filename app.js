@@ -74,6 +74,7 @@ function bindEvents() {
 
   if (els.refreshButton) {
     els.refreshButton.addEventListener('click', async () => {
+      state.wikiCategoryCache = {};
       await loadAllData();
       render();
       await fillMissingInfo();
@@ -196,41 +197,58 @@ async function fillMissingInfo() {
 
   setStatus(`Не хватает данных по ${missing.length} предметам. Начинаю парсинг...`);
 
-  const grouped = {};
-  missing.forEach((item) => {
-    const categoryKey = item.category || state.categoryByItemId[item.itemId] || 'misc';
-    if (!grouped[categoryKey]) grouped[categoryKey] = [];
-    grouped[categoryKey].push(item);
-  });
-
+  const batchSize = 25;
   let processed = 0;
-  const total = missing.length;
 
-  for (const categoryKey of Object.keys(grouped)) {
-    const wikiSlug = GROUP_KEY_TO_WIKI_SLUG[categoryKey] || 'misc';
-    const namesMap = await fetchCategoryItemsMap(wikiSlug);
+  for (let start = 0; start < missing.length; start += batchSize) {
+    const batch = missing.slice(start, start + batchSize);
 
-    for (const item of grouped[categoryKey]) {
-      const resolvedName = namesMap[item.itemId] || '';
+    await Promise.all(batch.map(async (item) => {
+      try {
+        const categoryKey = item.category || state.categoryByItemId[item.itemId] || 'misc';
+        const wikiSlug = GROUP_KEY_TO_WIKI_SLUG[categoryKey] || 'misc';
 
-      if (resolvedName) {
-        item.category = categoryKey;
-        item.name = resolvedName;
-        item.price = normalizePrice(item.price, 1);
-        item.image = item.image || buildDefaultImage(item.itemId);
-        item.updatedAt = Date.now();
+        let resolvedName = '';
 
-        await saveItemToFirebase(item);
-      } else {
-        item.name = `Предмет #${item.itemId}`;
+        try {
+          const namesMap = await fetchCategoryItemsMap(wikiSlug);
+          resolvedName = namesMap[item.itemId] || '';
+        } catch (e) {}
+
+        if (!resolvedName) {
+          try {
+            const wikiUrl = `https://wiki.majestic-rp.ru/ru/items/${wikiSlug}/${item.itemId}`;
+            resolvedName = await fetchDirectItemName(wikiUrl);
+          } catch (e) {}
+        }
+
+        if (!resolvedName) {
+          try {
+            const wikiUrl = `https://wiki.majestic-rp.ru/en/items/${wikiSlug}/${item.itemId}`;
+            resolvedName = await fetchDirectItemName(wikiUrl);
+          } catch (e) {}
+        }
+
+        if (resolvedName) {
+          item.category = categoryKey;
+          item.name = resolvedName;
+          item.price = normalizePrice(item.price, 1);
+          item.image = item.image || buildDefaultImage(item.itemId);
+          item.updatedAt = Date.now();
+
+          await saveItemToFirebase(item);
+        } else {
+          item.name = `Предмет #${item.itemId}`;
+        }
+      } catch (error) {
+        console.warn('Failed to resolve item:', item.itemId, error);
+        item.name = item.name || `Предмет #${item.itemId}`;
       }
+    }));
 
-      processed++;
-      if (processed % 8 === 0 || processed === total) {
-        setStatus(`Парсинг и сохранение: ${processed}/${total}`);
-        render();
-      }
-    }
+    processed += batch.length;
+    setStatus(`Парсинг и сохранение: ${processed}/${missing.length}`);
+    render();
   }
 
   setStatus(`Синхронизация завершена. Предметов: ${state.items.length}`);
@@ -242,34 +260,72 @@ async function fetchCategoryItemsMap(wikiSlug) {
     return state.wikiCategoryCache[wikiSlug];
   }
 
-  const url = `https://wiki.majestic-rp.ru/en/items/${wikiSlug}`;
-  const response = await fetch(url);
+  const urls = [
+    `https://wiki.majestic-rp.ru/ru/items/${wikiSlug}`,
+    `https://wiki.majestic-rp.ru/en/items/${wikiSlug}`
+  ];
+
+  const result = {};
+
+  for (const url of urls) {
+    try {
+      const response = await fetch(url);
+      if (!response.ok) continue;
+
+      const html = await response.text();
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+      const text = normalizeText(doc.body.textContent || '');
+
+      const regex = /([A-Za-zА-Яа-я0-9 .,'"()\-+/№#]+?)\s+(\d{1,4})\s+\d+\s*x\s*\d+/g;
+      let match;
+
+      while ((match = regex.exec(text)) !== null) {
+        const name = normalizeText(match[1]);
+        const itemId = Number(match[2]);
+
+        if (!Number.isNaN(itemId) && name && !result[itemId]) {
+          result[itemId] = name;
+        }
+      }
+    } catch (e) {}
+  }
+
+  state.wikiCategoryCache[wikiSlug] = result;
+  return result;
+}
+
+async function fetchDirectItemName(wikiUrl) {
+  const response = await fetch(wikiUrl);
   if (!response.ok) {
-    throw new Error(`wiki category HTTP ${response.status}`);
+    throw new Error(`wiki item HTTP ${response.status}`);
   }
 
   const html = await response.text();
   const doc = new DOMParser().parseFromString(html, 'text/html');
-  const text = normalizeText(doc.body.textContent || '');
 
-  const result = {};
-
-  // Паттерн: "Name ... 883 2 x 1 0.001 kg Marketplace"
-  const regex = /([A-Za-zА-Яа-я0-9 .,'"()\-+/]+?)\s+(\d{1,4})\s+\d+\s*x\s*\d+/g;
-  let match;
-
-  while ((match = regex.exec(text)) !== null) {
-    const name = normalizeText(match[1]);
-    const itemId = Number(match[2]);
-
-    if (!Number.isNaN(itemId) && name && !result[itemId]) {
-      result[itemId] = name;
-    }
+  const exactH1 = doc.querySelector('h1.yRrGW6a3');
+  if (exactH1) {
+    const value = normalizeText(exactH1.textContent);
+    if (value) return value;
   }
 
-  // Доп. fallback по h1 на случай, если category page пустая
-  state.wikiCategoryCache[wikiSlug] = result;
-  return result;
+  const anyH1 = doc.querySelector('h1');
+  if (anyH1) {
+    const value = normalizeText(anyH1.textContent);
+    if (value) return value;
+  }
+
+  const title = doc.querySelector('title');
+  if (title) {
+    const value = normalizeText(title.textContent)
+      .replace(/ · Предмет GTA5 RP · Majestic Вики$/i, '')
+      .replace(/ \| .*$/i, '')
+      .trim();
+
+    if (value) return value;
+  }
+
+  return '';
 }
 
 async function saveItemToFirebase(item) {
