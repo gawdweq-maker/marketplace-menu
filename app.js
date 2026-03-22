@@ -13,7 +13,7 @@ const GROUP_KEY_TO_WIKI_SLUG = {
   auto_parts: 'auto-parts',
   misc: 'misc',
   consumables: 'consumables',
-  facilities: 'infrastructure',
+  facilities: 'facilities',
   documents: 'documents',
   books: 'books',
   personals: 'personal-items',
@@ -21,7 +21,7 @@ const GROUP_KEY_TO_WIKI_SLUG = {
   agriculture: 'agriculture',
   drugs: 'ingredients',
   armor: 'armor',
-  others: 'misc'
+  others: 'others'
 };
 
 const state = {
@@ -30,7 +30,8 @@ const state = {
   items: [],
   favorites: new Set(loadFavorites()),
   categoryByItemId: {},
-  firebaseCatalog: {}
+  firebaseCatalog: {},
+  wikiCategoryCache: {}
 };
 
 const els = {
@@ -112,7 +113,6 @@ async function loadFirebaseCatalog() {
   try {
     const response = await fetch(buildDbUrl('catalog'));
     if (!response.ok) return {};
-
     const raw = await response.json();
     return raw || {};
   } catch (error) {
@@ -187,28 +187,31 @@ function mergeCatalog(baseItems, firebaseCatalog) {
 }
 
 async function fillMissingInfo() {
-  const missing = state.items.filter(
-    (item) => !item.name || item.name.trim() === ''
-  );
+  const missing = state.items.filter((item) => !item.name || item.name.trim() === '');
 
   if (!missing.length) {
     setStatus(`Firebase заполнен. Предметов: ${state.items.length}`);
     return;
   }
 
-  setStatus(`Не хватает названий для ${missing.length} предметов. Начинаю парсинг...`);
+  setStatus(`Не хватает данных по ${missing.length} предметам. Начинаю парсинг...`);
 
-  for (let i = 0; i < missing.length; i++) {
-    const item = missing[i];
+  const grouped = {};
+  missing.forEach((item) => {
+    const categoryKey = item.category || state.categoryByItemId[item.itemId] || 'misc';
+    if (!grouped[categoryKey]) grouped[categoryKey] = [];
+    grouped[categoryKey].push(item);
+  });
 
-    try {
-      const categoryKey = item.category || state.categoryByItemId[item.itemId] || 'misc';
-      const wikiSlug = GROUP_KEY_TO_WIKI_SLUG[categoryKey] || 'misc';
-      const wikiUrl = `https://wiki.majestic-rp.ru/ru/items/${wikiSlug}/${item.itemId}`;
+  let processed = 0;
+  const total = missing.length;
 
-      console.log('[wiki-try]', item.itemId, categoryKey, wikiUrl);
+  for (const categoryKey of Object.keys(grouped)) {
+    const wikiSlug = GROUP_KEY_TO_WIKI_SLUG[categoryKey] || 'misc';
+    const namesMap = await fetchCategoryItemsMap(wikiSlug);
 
-      const resolvedName = await fetchWikiItemName(wikiUrl);
+    for (const item of grouped[categoryKey]) {
+      const resolvedName = namesMap[item.itemId] || '';
 
       if (resolvedName) {
         item.category = categoryKey;
@@ -217,21 +220,16 @@ async function fillMissingInfo() {
         item.image = item.image || buildDefaultImage(item.itemId);
         item.updatedAt = Date.now();
 
-        console.log('[wiki-success]', item.itemId, resolvedName);
-
         await saveItemToFirebase(item);
       } else {
-        console.log('[wiki-empty]', item.itemId, wikiUrl);
         item.name = `Предмет #${item.itemId}`;
       }
-    } catch (error) {
-      console.warn('[wiki-fail]', item.itemId, error);
-      item.name = item.name || `Предмет #${item.itemId}`;
-    }
 
-    if (i % 5 === 0 || i === missing.length - 1) {
-      setStatus(`Парсинг и сохранение: ${i + 1}/${missing.length}`);
-      render();
+      processed++;
+      if (processed % 8 === 0 || processed === total) {
+        setStatus(`Парсинг и сохранение: ${processed}/${total}`);
+        render();
+      }
     }
   }
 
@@ -239,55 +237,39 @@ async function fillMissingInfo() {
   render();
 }
 
-async function fetchWikiItemName(wikiUrl) {
-  const response = await fetch(wikiUrl);
+async function fetchCategoryItemsMap(wikiSlug) {
+  if (state.wikiCategoryCache[wikiSlug]) {
+    return state.wikiCategoryCache[wikiSlug];
+  }
+
+  const url = `https://wiki.majestic-rp.ru/en/items/${wikiSlug}`;
+  const response = await fetch(url);
   if (!response.ok) {
-    throw new Error(`wiki HTTP ${response.status}`);
+    throw new Error(`wiki category HTTP ${response.status}`);
   }
 
   const html = await response.text();
   const doc = new DOMParser().parseFromString(html, 'text/html');
+  const text = normalizeText(doc.body.textContent || '');
 
-  // 1. Точный паттерн, который ты нашёл
-  const exactH1 = doc.querySelector('h1.yRrGW6a3');
-  if (exactH1) {
-    const value = normalizeText(exactH1.textContent);
-    if (value) return value;
-  }
+  const result = {};
 
-  // 2. Любой h1 как запасной вариант
-  const anyH1 = doc.querySelector('h1');
-  if (anyH1) {
-    const value = normalizeText(anyH1.textContent);
-    if (value) return value;
-  }
+  // Паттерн: "Name ... 883 2 x 1 0.001 kg Marketplace"
+  const regex = /([A-Za-zА-Яа-я0-9 .,'"()\-+/]+?)\s+(\d{1,4})\s+\d+\s*x\s*\d+/g;
+  let match;
 
-  // 3. Паттерн через span "Вернуться к списку"
-  const spans = Array.from(doc.querySelectorAll('span'));
-  const backNode = spans.find(node => normalizeText(node.textContent) === 'Вернуться к списку');
-  if (backNode) {
-    const next =
-      backNode.parentElement?.nextElementSibling ||
-      backNode.closest('*')?.nextElementSibling;
+  while ((match = regex.exec(text)) !== null) {
+    const name = normalizeText(match[1]);
+    const itemId = Number(match[2]);
 
-    if (next) {
-      const value = normalizeText(next.textContent);
-      if (value) return value;
+    if (!Number.isNaN(itemId) && name && !result[itemId]) {
+      result[itemId] = name;
     }
   }
 
-  // 4. title как последний fallback
-  const title = doc.querySelector('title');
-  if (title) {
-    const value = normalizeText(title.textContent)
-      .replace(/ · Предмет GTA5 RP · Majestic Вики$/i, '')
-      .replace(/ \| .*$/i, '')
-      .trim();
-
-    if (value) return value;
-  }
-
-  return null;
+  // Доп. fallback по h1 на случай, если category page пустая
+  state.wikiCategoryCache[wikiSlug] = result;
+  return result;
 }
 
 async function saveItemToFirebase(item) {
@@ -300,8 +282,6 @@ async function saveItemToFirebase(item) {
     updatedAt: Date.now()
   };
 
-  console.log('[firebase-save-try]', item.itemId, payload);
-
   const response = await fetch(buildDbUrl(`catalog/${item.itemId}`), {
     method: 'PATCH',
     headers: {
@@ -313,9 +293,6 @@ async function saveItemToFirebase(item) {
   if (!response.ok) {
     throw new Error(`firebase PATCH HTTP ${response.status}`);
   }
-
-  const result = await response.json();
-  console.log('[firebase-save-success]', item.itemId, result);
 }
 
 function normalizeText(value) {
@@ -336,6 +313,17 @@ function normalizePrice(price, fallback = 1) {
 
 function buildDefaultImage(itemId) {
   return `https://cdn-eu.majestic-files.net/public/master/static/img/inventory/items/${itemId}.webp`;
+}
+
+function buildPlaceholderImage(itemId) {
+  const svg = `
+    <svg xmlns="http://www.w3.org/2000/svg" width="96" height="96">
+      <rect width="100%" height="100%" rx="12" ry="12" fill="#1d2430"/>
+      <text x="50%" y="48%" text-anchor="middle" dominant-baseline="middle" fill="#8fa3c7" font-family="Arial" font-size="13">Нет фото</text>
+      <text x="50%" y="68%" text-anchor="middle" dominant-baseline="middle" fill="#6e7f9f" font-family="Arial" font-size="12">#${itemId}</text>
+    </svg>
+  `;
+  return `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(svg)}`;
 }
 
 function setStatus(text) {
@@ -426,6 +414,7 @@ function renderGrid(container, items) {
   container.innerHTML = items.map((item) => {
     const active = state.favorites.has(item.itemId);
     const itemName = item.name || `Предмет #${item.itemId}`;
+    const fallbackImage = buildPlaceholderImage(item.itemId);
 
     return `
       <div class="item-card">
@@ -443,6 +432,7 @@ function renderGrid(container, items) {
             src="${escapeHtml(item.image)}"
             alt="${escapeHtml(itemName)}"
             loading="lazy"
+            onerror="this.onerror=null;this.src='${escapeHtml(fallbackImage)}';"
           />
         </div>
 
