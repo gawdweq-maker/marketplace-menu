@@ -2,11 +2,35 @@ const FIREBASE_DB_URL = 'https://mar-73-default-rtdb.europe-west1.firebasedataba
 const GLIST_URL = 'https://gist.githubusercontent.com/revo12/2a9c956f1d3ff3c9af769dc5d532e339/raw/8dd5c3ef679092216bb3b9ddfab2926dc6bd2e85/itemid';
 const FAVORITES_STORAGE_KEY = 'marketplace_menu_favorites';
 
+const GROUP_KEY_TO_WIKI_SLUG = {
+  food: 'food',
+  tool: 'tools',
+  fish: 'fish',
+  equipment: 'equipment',
+  alcohol: 'alcohol',
+  ammunition: 'ammunition',
+  medical: 'medicine',
+  auto_parts: 'auto-parts',
+  misc: 'misc',
+  consumables: 'consumables',
+  facilities: 'infrastructure',
+  documents: 'documents',
+  books: 'books',
+  personals: 'personal-items',
+  products: 'products',
+  agriculture: 'agriculture',
+  drugs: 'ingredients',
+  armor: 'armor',
+  others: 'misc'
+};
+
 const state = {
   activeTab: 'favorites',
   search: '',
   items: [],
-  favorites: new Set(loadFavorites())
+  favorites: new Set(loadFavorites()),
+  categoryByItemId: {},
+  firebaseCatalog: {}
 };
 
 const els = {
@@ -14,13 +38,10 @@ const els = {
   searchInput: document.getElementById('searchInput'),
   refreshButton: document.getElementById('refreshButton'),
   statusBar: document.getElementById('statusBar'),
-
   favoritesView: document.getElementById('favoritesView'),
   libraryView: document.getElementById('libraryView'),
-
   favoritesGrid: document.getElementById('favoritesGrid'),
   libraryGrid: document.getElementById('libraryGrid'),
-
   favoritesEmpty: document.getElementById('favoritesEmpty'),
   libraryEmpty: document.getElementById('libraryEmpty')
 };
@@ -31,6 +52,7 @@ async function init() {
   bindEvents();
   await loadAllData();
   render();
+  resolveMissingNamesInBackground();
 }
 
 function bindEvents() {
@@ -53,6 +75,7 @@ function bindEvents() {
     els.refreshButton.addEventListener('click', async () => {
       await loadAllData();
       render();
+      resolveMissingNamesInBackground();
     });
   }
 }
@@ -69,9 +92,9 @@ async function loadAllData() {
   const glist = await loadGlist();
 
   setStatus('Загрузка данных Firebase...');
-  const firebaseCatalog = await loadFirebaseCatalog();
+  state.firebaseCatalog = await loadFirebaseCatalog();
 
-  state.items = mergeCatalog(glist, firebaseCatalog);
+  state.items = mergeCatalog(glist, state.firebaseCatalog);
   setStatus(`Загружено предметов: ${state.items.length}`);
 }
 
@@ -88,10 +111,7 @@ async function loadGlist() {
 async function loadFirebaseCatalog() {
   try {
     const response = await fetch(buildDbUrl('catalog'));
-    if (!response.ok) {
-      return {};
-    }
-
+    if (!response.ok) return {};
     const raw = await response.json();
     return raw || {};
   } catch (error) {
@@ -102,6 +122,7 @@ async function loadFirebaseCatalog() {
 
 function normalizeGlist(raw) {
   const result = new Map();
+  const categoryByItemId = {};
 
   Object.keys(raw || {}).forEach((groupName) => {
     const ids = Array.isArray(raw[groupName]) ? raw[groupName] : [];
@@ -110,10 +131,12 @@ function normalizeGlist(raw) {
       const id = Number(itemId);
       if (Number.isNaN(id)) return;
 
+      categoryByItemId[id] = groupName;
+
       if (!result.has(id)) {
         result.set(id, {
           itemId: id,
-          name: `Предмет #${id}`,
+          name: '',
           price: 1,
           image: buildDefaultImage(id),
           updatedAt: 0
@@ -122,6 +145,7 @@ function normalizeGlist(raw) {
     });
   });
 
+  state.categoryByItemId = categoryByItemId;
   return Array.from(result.values()).sort((a, b) => a.itemId - b.itemId);
 }
 
@@ -135,12 +159,11 @@ function mergeCatalog(baseItems, firebaseCatalog) {
   Object.keys(firebaseCatalog || {}).forEach((key) => {
     const row = firebaseCatalog[key] || {};
     const itemId = Number(row.itemId ?? key);
-
     if (Number.isNaN(itemId)) return;
 
     const existing = map.get(itemId) || {
       itemId,
-      name: `Предмет #${itemId}`,
+      name: '',
       price: 1,
       image: buildDefaultImage(itemId),
       updatedAt: 0
@@ -156,6 +179,102 @@ function mergeCatalog(baseItems, firebaseCatalog) {
   });
 
   return Array.from(map.values()).sort((a, b) => a.itemId - b.itemId);
+}
+
+async function resolveMissingNamesInBackground() {
+  const missing = state.items.filter((item) => !item.name || item.name.trim() === '');
+  if (!missing.length) {
+    setStatus(`Загружено предметов: ${state.items.length}`);
+    return;
+  }
+
+  setStatus(`Подтягиваю названия: 0/${missing.length}`);
+
+  for (let i = 0; i < missing.length; i++) {
+    const item = missing[i];
+
+    try {
+      const categoryKey = state.categoryByItemId[item.itemId] || 'misc';
+      const wikiSlug = GROUP_KEY_TO_WIKI_SLUG[categoryKey] || 'misc';
+      const wikiUrl = `https://wiki.majestic-rp.ru/ru/items/${wikiSlug}/${item.itemId}`;
+
+      const name = await fetchWikiItemName(wikiUrl);
+      if (name) {
+        item.name = name;
+        await saveNameToFirebase(item.itemId, name, item.image);
+      } else {
+        item.name = `Предмет #${item.itemId}`;
+      }
+    } catch (error) {
+      console.warn('Failed to resolve item name:', item.itemId, error);
+      item.name = item.name || `Предмет #${item.itemId}`;
+    }
+
+    if (i % 8 === 0 || i === missing.length - 1) {
+      setStatus(`Подтягиваю названия: ${i + 1}/${missing.length}`);
+      render();
+    }
+  }
+
+  setStatus(`Загружено предметов: ${state.items.length}`);
+  render();
+}
+
+async function fetchWikiItemName(wikiUrl) {
+  const response = await fetch(wikiUrl);
+  if (!response.ok) {
+    throw new Error(`wiki HTTP ${response.status}`);
+  }
+
+  const html = await response.text();
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(html, 'text/html');
+
+  const h1 = doc.querySelector('h1');
+  if (h1) {
+    const value = normalizeText(h1.textContent);
+    if (value) return value;
+  }
+
+  const title = doc.querySelector('title');
+  if (title) {
+    const raw = normalizeText(title.textContent);
+    const cleaned = raw
+      .replace(/ · Предмет GTA5 RP · Majestic Вики$/i, '')
+      .replace(/ \| .*$/i, '')
+      .trim();
+
+    if (cleaned) return cleaned;
+  }
+
+  return null;
+}
+
+async function saveNameToFirebase(itemId, name, image) {
+  try {
+    await fetch(buildDbUrl(`catalog/${itemId}`), {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        itemId,
+        name,
+        price: 1,
+        image: image || buildDefaultImage(itemId),
+        updatedAt: Date.now()
+      })
+    });
+  } catch (error) {
+    console.warn('Failed to save item name to Firebase:', itemId, error);
+  }
+}
+
+function normalizeText(value) {
+  return String(value || '')
+    .replace(/\s+/g, ' ')
+    .replace(/\u00A0/g, ' ')
+    .trim();
 }
 
 function normalizePrice(price, fallback = 1) {
@@ -224,7 +343,8 @@ function getFilteredItems() {
   const searchValue = state.search || '';
 
   const bySearch = state.items.filter((item) => {
-    const searchByName = item.name.toLowerCase().includes(searchValue);
+    const itemName = (item.name || '').toLowerCase();
+    const searchByName = itemName.includes(searchValue);
     const searchById = String(item.itemId).includes(searchValue);
     return searchByName || searchById;
   });
@@ -274,13 +394,13 @@ function renderGrid(container, items) {
           <img
             class="item-card__image"
             src="${escapeHtml(item.image)}"
-            alt="${escapeHtml(item.name)}"
+            alt="${escapeHtml(item.name || ('Предмет #' + item.itemId))}"
             loading="lazy"
           />
         </div>
 
         <div class="item-card__body">
-          <div class="item-card__name">${escapeHtml(item.name)}</div>
+          <div class="item-card__name">${escapeHtml(item.name || ('Предмет #' + item.itemId))}</div>
           <div class="item-card__id">ID: ${escapeHtml(item.itemId)}</div>
         </div>
       </div>
