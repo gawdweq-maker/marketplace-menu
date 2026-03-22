@@ -52,7 +52,7 @@ async function init() {
   bindEvents();
   await loadAllData();
   render();
-  resolveMissingNamesInBackground();
+  await fillMissingInfo();
 }
 
 function bindEvents() {
@@ -75,7 +75,7 @@ function bindEvents() {
     els.refreshButton.addEventListener('click', async () => {
       await loadAllData();
       render();
-      resolveMissingNamesInBackground();
+      await fillMissingInfo();
     });
   }
 }
@@ -88,10 +88,10 @@ function buildDbUrl(path) {
 }
 
 async function loadAllData() {
-  setStatus('Загрузка glist...');
+  setStatus('Загрузка списка предметов...');
   const glist = await loadGlist();
 
-  setStatus('Загрузка данных Firebase...');
+  setStatus('Чтение Firebase...');
   state.firebaseCatalog = await loadFirebaseCatalog();
 
   state.items = mergeCatalog(glist, state.firebaseCatalog);
@@ -112,10 +112,11 @@ async function loadFirebaseCatalog() {
   try {
     const response = await fetch(buildDbUrl('catalog'));
     if (!response.ok) return {};
+
     const raw = await response.json();
     return raw || {};
   } catch (error) {
-    console.warn('Firebase catalog unavailable:', error);
+    console.warn('Firebase unavailable:', error);
     return {};
   }
 }
@@ -136,6 +137,7 @@ function normalizeGlist(raw) {
       if (!result.has(id)) {
         result.set(id, {
           itemId: id,
+          category: groupName,
           name: '',
           price: 1,
           image: buildDefaultImage(id),
@@ -159,10 +161,12 @@ function mergeCatalog(baseItems, firebaseCatalog) {
   Object.keys(firebaseCatalog || {}).forEach((key) => {
     const row = firebaseCatalog[key] || {};
     const itemId = Number(row.itemId ?? key);
+
     if (Number.isNaN(itemId)) return;
 
     const existing = map.get(itemId) || {
       itemId,
+      category: row.category || state.categoryByItemId[itemId] || 'misc',
       name: '',
       price: 1,
       image: buildDefaultImage(itemId),
@@ -171,6 +175,7 @@ function mergeCatalog(baseItems, firebaseCatalog) {
 
     map.set(itemId, {
       itemId,
+      category: row.category || existing.category,
       name: row.name ? String(row.name) : existing.name,
       price: normalizePrice(row.price, existing.price),
       image: row.image || existing.image,
@@ -181,42 +186,51 @@ function mergeCatalog(baseItems, firebaseCatalog) {
   return Array.from(map.values()).sort((a, b) => a.itemId - b.itemId);
 }
 
-async function resolveMissingNamesInBackground() {
-  const missing = state.items.filter((item) => !item.name || item.name.trim() === '');
+async function fillMissingInfo() {
+  const missing = state.items.filter(
+    (item) => !item.name || !item.category || item.price === null || item.price === undefined
+  );
+
   if (!missing.length) {
-    setStatus(`Загружено предметов: ${state.items.length}`);
+    setStatus(`Firebase заполнен. Предметов: ${state.items.length}`);
     return;
   }
 
-  setStatus(`Подтягиваю названия: 0/${missing.length}`);
+  setStatus(`Не хватает данных по ${missing.length} предметам. Начинаю парсинг...`);
 
   for (let i = 0; i < missing.length; i++) {
     const item = missing[i];
 
     try {
-      const categoryKey = state.categoryByItemId[item.itemId] || 'misc';
+      const categoryKey = item.category || state.categoryByItemId[item.itemId] || 'misc';
       const wikiSlug = GROUP_KEY_TO_WIKI_SLUG[categoryKey] || 'misc';
       const wikiUrl = `https://wiki.majestic-rp.ru/ru/items/${wikiSlug}/${item.itemId}`;
 
-      const name = await fetchWikiItemName(wikiUrl);
-      if (name) {
-        item.name = name;
-        await saveNameToFirebase(item.itemId, name, item.image);
+      const resolvedName = await fetchWikiItemName(wikiUrl);
+
+      if (resolvedName) {
+        item.category = categoryKey;
+        item.name = resolvedName;
+        item.price = normalizePrice(item.price, 1);
+        item.image = item.image || buildDefaultImage(item.itemId);
+        item.updatedAt = Date.now();
+
+        await saveItemToFirebase(item);
       } else {
-        item.name = `Предмет #${item.itemId}`;
+        item.name = item.name || `Предмет #${item.itemId}`;
       }
     } catch (error) {
-      console.warn('Failed to resolve item name:', item.itemId, error);
+      console.warn('Failed to resolve item:', item.itemId, error);
       item.name = item.name || `Предмет #${item.itemId}`;
     }
 
-    if (i % 8 === 0 || i === missing.length - 1) {
-      setStatus(`Подтягиваю названия: ${i + 1}/${missing.length}`);
+    if (i % 6 === 0 || i === missing.length - 1) {
+      setStatus(`Парсинг и сохранение: ${i + 1}/${missing.length}`);
       render();
     }
   }
 
-  setStatus(`Загружено предметов: ${state.items.length}`);
+  setStatus(`Синхронизация завершена. Предметов: ${state.items.length}`);
   render();
 }
 
@@ -227,8 +241,7 @@ async function fetchWikiItemName(wikiUrl) {
   }
 
   const html = await response.text();
-  const parser = new DOMParser();
-  const doc = parser.parseFromString(html, 'text/html');
+  const doc = new DOMParser().parseFromString(html, 'text/html');
 
   const h1 = doc.querySelector('h1');
   if (h1) {
@@ -238,35 +251,37 @@ async function fetchWikiItemName(wikiUrl) {
 
   const title = doc.querySelector('title');
   if (title) {
-    const raw = normalizeText(title.textContent);
-    const cleaned = raw
+    const value = normalizeText(title.textContent)
       .replace(/ · Предмет GTA5 RP · Majestic Вики$/i, '')
       .replace(/ \| .*$/i, '')
       .trim();
 
-    if (cleaned) return cleaned;
+    if (value) return value;
   }
 
   return null;
 }
 
-async function saveNameToFirebase(itemId, name, image) {
-  try {
-    await fetch(buildDbUrl(`catalog/${itemId}`), {
-      method: 'PATCH',
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        itemId,
-        name,
-        price: 1,
-        image: image || buildDefaultImage(itemId),
-        updatedAt: Date.now()
-      })
-    });
-  } catch (error) {
-    console.warn('Failed to save item name to Firebase:', itemId, error);
+async function saveItemToFirebase(item) {
+  const payload = {
+    itemId: item.itemId,
+    category: item.category,
+    name: item.name,
+    price: normalizePrice(item.price, 1),
+    image: item.image || buildDefaultImage(item.itemId),
+    updatedAt: Date.now()
+  };
+
+  const response = await fetch(buildDbUrl(`catalog/${item.itemId}`), {
+    method: 'PATCH',
+    headers: {
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(payload)
+  });
+
+  if (!response.ok) {
+    throw new Error(`firebase PATCH HTTP ${response.status}`);
   }
 }
 
@@ -344,9 +359,7 @@ function getFilteredItems() {
 
   const bySearch = state.items.filter((item) => {
     const itemName = (item.name || '').toLowerCase();
-    const searchByName = itemName.includes(searchValue);
-    const searchById = String(item.itemId).includes(searchValue);
-    return searchByName || searchById;
+    return itemName.includes(searchValue) || String(item.itemId).includes(searchValue);
   });
 
   if (state.activeTab === 'favorites') {
@@ -379,6 +392,7 @@ function renderGrid(container, items) {
 
   container.innerHTML = items.map((item) => {
     const active = state.favorites.has(item.itemId);
+    const itemName = item.name || `Предмет #${item.itemId}`;
 
     return `
       <div class="item-card">
@@ -394,14 +408,13 @@ function renderGrid(container, items) {
           <img
             class="item-card__image"
             src="${escapeHtml(item.image)}"
-            alt="${escapeHtml(item.name || ('Предмет #' + item.itemId))}"
+            alt="${escapeHtml(itemName)}"
             loading="lazy"
           />
         </div>
 
         <div class="item-card__body">
-          <div class="item-card__name">${escapeHtml(item.name || ('Предмет #' + item.itemId))}</div>
-          <div class="item-card__id">ID: ${escapeHtml(item.itemId)}</div>
+          <div class="item-card__name">${escapeHtml(itemName)}</div>
         </div>
       </div>
     `;
