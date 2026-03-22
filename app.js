@@ -243,12 +243,35 @@ async function fetchWikiItemName(wikiUrl) {
   const html = await response.text();
   const doc = new DOMParser().parseFromString(html, 'text/html');
 
-  const h1 = doc.querySelector('h1');
-  if (h1) {
-    const value = normalizeText(h1.textContent);
+  // 1. Точный паттерн, который ты нашёл
+  const exactH1 = doc.querySelector('h1.yRrGW6a3');
+  if (exactH1) {
+    const value = normalizeText(exactH1.textContent);
     if (value) return value;
   }
 
+  // 2. Любой h1 как запасной вариант
+  const anyH1 = doc.querySelector('h1');
+  if (anyH1) {
+    const value = normalizeText(anyH1.textContent);
+    if (value) return value;
+  }
+
+  // 3. Паттерн через span "Вернуться к списку"
+  const spans = Array.from(doc.querySelectorAll('span'));
+  const backNode = spans.find(node => normalizeText(node.textContent) === 'Вернуться к списку');
+  if (backNode) {
+    const next =
+      backNode.parentElement?.nextElementSibling ||
+      backNode.closest('*')?.nextElementSibling;
+
+    if (next) {
+      const value = normalizeText(next.textContent);
+      if (value) return value;
+    }
+  }
+
+  // 4. title как последний fallback
   const title = doc.querySelector('title');
   if (title) {
     const value = normalizeText(title.textContent)
