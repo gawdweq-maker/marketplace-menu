@@ -1,30 +1,25 @@
-const CONFIG = {
-  glistUrl:
-    'https://gist.githubusercontent.com/revo12/2a9c956f1d3ff3c9af769dc5d532e339/raw/8dd5c3ef679092216bb3b9ddfab2926dc6bd2e85/itemid',
-
-  metaUrl: './items-meta.json',
-
-  imageUrlById: (itemId) =>
-    `https://cdn-eu.majestic-files.net/public/master/static/img/inventory/items/${itemId}.webp`,
-
-  favoritesStorageKey: 'marketplace_menu_favorites'
-};
+const FIREBASE_DB_URL = 'https://mar-7-default-rtdb.europe-west1.firebasedatabase.app';
+const FAVORITES_STORAGE_KEY = 'marketplace_menu_favorites';
 
 const state = {
   activeTab: 'favorites',
   search: '',
   items: [],
-  favorites: new Set(loadFavorites()),
-  metaMap: {}
+  favorites: new Set(loadFavorites())
 };
 
 const els = {
   tabs: Array.from(document.querySelectorAll('.tab')),
   searchInput: document.getElementById('searchInput'),
+  refreshButton: document.getElementById('refreshButton'),
+  statusBar: document.getElementById('statusBar'),
+
   favoritesView: document.getElementById('favoritesView'),
   libraryView: document.getElementById('libraryView'),
+
   favoritesGrid: document.getElementById('favoritesGrid'),
   libraryGrid: document.getElementById('libraryGrid'),
+
   favoritesEmpty: document.getElementById('favoritesEmpty'),
   libraryEmpty: document.getElementById('libraryEmpty')
 };
@@ -33,8 +28,7 @@ init();
 
 async function init() {
   bindEvents();
-  await loadMeta();
-  await loadItems();
+  await loadCatalog();
   render();
 }
 
@@ -51,55 +45,69 @@ function bindEvents() {
     state.search = e.target.value.trim().toLowerCase();
     render();
   });
+
+  els.refreshButton.addEventListener('click', async () => {
+    await loadCatalog();
+    render();
+  });
 }
 
-async function loadMeta() {
-  try {
-    const response = await fetch(CONFIG.metaUrl);
-    const raw = await response.json();
-    state.metaMap = raw || {};
-  } catch (error) {
-    console.error('Failed to load items-meta.json:', error);
-    state.metaMap = {};
-  }
+function buildDbUrl(path) {
+  const cleanPath = String(path || '').replace(/^\/+|\/+$/g, '');
+  return cleanPath
+    ? `${FIREBASE_DB_URL}/${cleanPath}.json`
+    : `${FIREBASE_DB_URL}/.json`;
 }
 
-async function loadItems() {
+async function loadCatalog() {
+  setStatus('Загрузка каталога...');
+
   try {
-    const response = await fetch(CONFIG.glistUrl);
+    const response = await fetch(buildDbUrl('catalog'));
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
     const raw = await response.json();
-    state.items = normalizeGlist(raw);
+    state.items = normalizeCatalog(raw);
+    setStatus(`Загружено предметов: ${state.items.length}`);
   } catch (error) {
-    console.error('Failed to load glist:', error);
+    console.error('Failed to load catalog:', error);
     state.items = [];
+    setStatus(`Ошибка загрузки каталога: ${error.message}`);
   }
 }
 
-function normalizeGlist(raw) {
-  const resultMap = new Map();
+function normalizeCatalog(raw) {
+  if (!raw || typeof raw !== 'object') return [];
 
-  for (const categoryName of Object.keys(raw || {})) {
-    const ids = Array.isArray(raw[categoryName]) ? raw[categoryName] : [];
+  return Object.keys(raw)
+    .map((key) => {
+      const item = raw[key] || {};
+      const itemId = Number(item.itemId ?? key);
+      const name = item.name ? String(item.name) : `Item ${itemId}`;
+      const price = item.price ?? '';
+      const image = item.image || buildDefaultImage(itemId);
+      const updatedAt = item.updatedAt ?? 0;
 
-    ids.forEach((itemId) => {
-      const id = Number(itemId);
-      if (Number.isNaN(id)) return;
+      return {
+        itemId,
+        name,
+        price,
+        image,
+        updatedAt
+      };
+    })
+    .filter((item) => !Number.isNaN(item.itemId))
+    .sort((a, b) => a.itemId - b.itemId);
+}
 
-      if (!resultMap.has(id)) {
-        const meta = state.metaMap[String(id)] || {};
+function buildDefaultImage(itemId) {
+  return `https://cdn-eu.majestic-files.net/public/master/static/img/inventory/items/${itemId}.webp`;
+}
 
-        resultMap.set(id, {
-          id,
-          name: meta.name || `Item ${id}`,
-          price: meta.price || '',
-          category: categoryName,
-          image: CONFIG.imageUrlById(id)
-        });
-      }
-    });
-  }
-
-  return Array.from(resultMap.values()).sort((a, b) => a.id - b.id);
+function setStatus(text) {
+  els.statusBar.textContent = text;
 }
 
 function updateTabs() {
@@ -113,7 +121,7 @@ function updateTabs() {
 
 function loadFavorites() {
   try {
-    const raw = localStorage.getItem(CONFIG.favoritesStorageKey);
+    const raw = localStorage.getItem(FAVORITES_STORAGE_KEY);
     if (!raw) return [];
     const parsed = JSON.parse(raw);
     return Array.isArray(parsed) ? parsed : [];
@@ -124,7 +132,7 @@ function loadFavorites() {
 
 function saveFavorites() {
   localStorage.setItem(
-    CONFIG.favoritesStorageKey,
+    FAVORITES_STORAGE_KEY,
     JSON.stringify(Array.from(state.favorites))
   );
 }
@@ -141,13 +149,14 @@ function toggleFavorite(itemId) {
 }
 
 function getFilteredItems() {
-  const bySearch = state.items.filter((item) =>
-    item.name.toLowerCase().includes(state.search) ||
-    String(item.id).includes(state.search)
-  );
+  const bySearch = state.items.filter((item) => {
+    const searchByName = item.name.toLowerCase().includes(state.search);
+    const searchById = String(item.itemId).includes(state.search);
+    return searchByName || searchById;
+  });
 
   if (state.activeTab === 'favorites') {
-    return bySearch.filter((item) => state.favorites.has(item.id));
+    return bySearch.filter((item) => state.favorites.has(item.itemId));
   }
 
   return bySearch;
@@ -169,15 +178,15 @@ function render() {
 
 function renderGrid(container, items) {
   container.innerHTML = items.map((item) => {
-    const active = state.favorites.has(item.id);
+    const active = state.favorites.has(item.itemId);
 
     return `
       <div class="item-card">
-        <div class="item-card__price">${escapeHtml(item.price || '')}</div>
+        <div class="item-card__price">${escapeHtml(formatPrice(item.price))}</div>
 
         <button
           class="item-card__favorite ${active ? 'item-card__favorite--active' : ''}"
-          data-favorite-id="${item.id}"
+          data-favorite-id="${item.itemId}"
           title="Добавить в избраное"
         >★</button>
 
@@ -192,6 +201,7 @@ function renderGrid(container, items) {
 
         <div class="item-card__body">
           <div class="item-card__name">${escapeHtml(item.name)}</div>
+          <div class="item-card__id">ID: ${escapeHtml(item.itemId)}</div>
         </div>
       </div>
     `;
@@ -199,10 +209,19 @@ function renderGrid(container, items) {
 
   container.querySelectorAll('[data-favorite-id]').forEach((button) => {
     button.addEventListener('click', () => {
-      const id = Number(button.dataset.favoriteId);
-      toggleFavorite(id);
+      const itemId = Number(button.dataset.favoriteId);
+      toggleFavorite(itemId);
     });
   });
+}
+
+function formatPrice(price) {
+  if (price === '' || price === null || price === undefined) return '';
+
+  const num = Number(price);
+  if (Number.isNaN(num)) return String(price);
+
+  return `${num.toLocaleString('ru-RU')}$`;
 }
 
 function escapeHtml(value) {
