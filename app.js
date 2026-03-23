@@ -30,6 +30,8 @@ const GROUP_KEY_TO_WIKI_SLUGS = {
   others: ['others', 'misc']
 };
 
+const ALL_WIKI_SLUGS = Array.from(new Set(Object.values(GROUP_KEY_TO_WIKI_SLUGS).flat()));
+
 const state = {
   activeTab: 'favorites',
   search: '',
@@ -99,7 +101,28 @@ async function fullRestart() {
   setStatus('Старт...');
   render();
   log('BOOT', 'Начало полной перезагрузки');
+
+  await testSupabaseRead();
   await progressiveBuildFromGlist();
+}
+
+async function testSupabaseRead() {
+  try {
+    log('DB', 'Проверка доступа к Supabase: select 1 row');
+    const { data, error } = await supabase
+      .from('items_catalog')
+      .select('item_id, category, name, price, updated_at')
+      .limit(1);
+
+    if (error) {
+      logError('DB', 'Ошибка тестового чтения Supabase', error);
+      return;
+    }
+
+    log('DB', 'Тестовое чтение Supabase успешно', { rows: data?.length || 0, data });
+  } catch (error) {
+    logError('DB', 'Критическая ошибка тестового чтения Supabase', error);
+  }
 }
 
 async function progressiveBuildFromGlist() {
@@ -212,7 +235,9 @@ async function enrichSingleItem(itemId, current, total) {
 
   try {
     item.statusText = 'Проверка базы...';
+    item.parseError = '';
     render();
+
     log('DB', 'Проверка записи в Supabase', { itemId });
 
     const dbRow = await loadSingleItemFromSupabase(itemId);
@@ -291,7 +316,7 @@ async function loadSingleItemFromSupabase(itemId) {
     .maybeSingle();
 
   if (error) {
-    throw new Error(`Supabase read error: ${error.message}`);
+    throw new Error(formatSupabaseError('Supabase read error', error));
   }
 
   return data;
@@ -299,14 +324,19 @@ async function loadSingleItemFromSupabase(itemId) {
 
 async function resolveNameForItem(item) {
   const categoryKey = item.category || state.categoryByItemId[item.itemId] || 'misc';
-  const slugCandidates = GROUP_KEY_TO_WIKI_SLUGS[categoryKey] || ['misc'];
+  const preferredSlugs = GROUP_KEY_TO_WIKI_SLUGS[categoryKey] || ['misc'];
+  const slugCandidates = [
+    ...preferredSlugs,
+    ...ALL_WIKI_SLUGS.filter((slug) => !preferredSlugs.includes(slug))
+  ];
 
   for (const slug of slugCandidates) {
     for (const lang of ['ru', 'en']) {
       const url = `https://wiki.majestic-rp.ru/${lang}/items/${slug}/${item.itemId}`;
+
       log('PARSE', 'Пробую URL', {
         itemId: item.itemId,
-        category: categoryKey,
+        originalCategory: categoryKey,
         slug,
         lang,
         url
@@ -319,6 +349,8 @@ async function resolveNameForItem(item) {
           item.category = categoryKey;
           log('PARSE', 'Успешный парсинг по URL', {
             itemId: item.itemId,
+            slug,
+            lang,
             url,
             name
           });
@@ -327,6 +359,8 @@ async function resolveNameForItem(item) {
 
         log('PARSE', 'Пустой результат по URL', {
           itemId: item.itemId,
+          slug,
+          lang,
           url
         });
       } catch (error) {
@@ -384,13 +418,29 @@ async function saveItemToSupabase(item) {
 
   log('DB', 'Upsert в Supabase', { payload });
 
-  const { error } = await supabase
+  const { data, error } = await supabase
     .from('items_catalog')
-    .upsert(payload, { onConflict: 'item_id' });
+    .upsert([payload], { onConflict: 'item_id' })
+    .select();
 
   if (error) {
-    throw new Error(`Supabase write error: ${error.message}`);
+    throw new Error(formatSupabaseError('Supabase write error', error));
   }
+
+  log('DB', 'Ответ Supabase после upsert', { data });
+  return data;
+}
+
+function formatSupabaseError(prefix, error) {
+  const parts = [
+    prefix,
+    error?.message ? `message=${error.message}` : '',
+    error?.details ? `details=${error.details}` : '',
+    error?.hint ? `hint=${error.hint}` : '',
+    error?.code ? `code=${error.code}` : ''
+  ].filter(Boolean);
+
+  return parts.join(' | ');
 }
 
 function delay(ms) {
@@ -517,10 +567,11 @@ function renderGrid(container, items) {
 
   container.innerHTML = items.map((item) => {
     const active = state.favorites.has(item.itemId);
-    const itemName = item.name || (item.parseError ? `Ошибка #${item.itemId}` : `Предмет #${item.itemId}`);
+    const itemName = item.name || `Предмет #${item.itemId}`;
     const fallbackImage = buildPlaceholderImage(item.itemId);
     const priceText = formatPrice(item.price);
     const titleText = item.parseError ? `${itemName} — ${item.parseError}` : itemName;
+    const errorText = item.parseError ? item.parseError : '';
 
     return `
       <div class="item-card" title="${escapeHtml(titleText)}">
@@ -544,6 +595,7 @@ function renderGrid(container, items) {
 
         <div class="item-card__body">
           <div class="item-card__name">${escapeHtml(itemName)}</div>
+          ${errorText ? `<div class="item-card__error">${escapeHtml(errorText)}</div>` : ''}
         </div>
       </div>
     `;
