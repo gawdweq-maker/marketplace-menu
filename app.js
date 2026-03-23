@@ -14,12 +14,17 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY);
 
 const state = {
   activeTab: 'favorites',
+  activeCategory: 'all',
+  sortMode: 'cheap',
   search: '',
   items: [],
   itemsMap: new Map(),
   favorites: new Set(loadFavorites()),
   parseRunning: false,
   categoryByItemId: {},
+  categoryOrder: [],
+  selectedItemId: null,
+  lotsByItemId: new Map(),
   stats: {
     total: 0,
     processed: 0,
@@ -34,19 +39,34 @@ const els = {
   tabs: Array.from(document.querySelectorAll('.tab')),
   searchInput: document.getElementById('searchInput'),
   refreshButton: document.getElementById('refreshButton'),
+  sortMenuButton: document.getElementById('sortMenuButton'),
   statusBar: document.getElementById('statusBar'),
   favoritesView: document.getElementById('favoritesView'),
-  libraryView: document.getElementById('libraryView'),
+  itemsView: document.getElementById('itemsView'),
   favoritesGrid: document.getElementById('favoritesGrid'),
-  libraryGrid: document.getElementById('libraryGrid'),
+  itemsGrid: document.getElementById('itemsGrid'),
   favoritesEmpty: document.getElementById('favoritesEmpty'),
-  libraryEmpty: document.getElementById('libraryEmpty')
+  itemsEmpty: document.getElementById('itemsEmpty'),
+  itemsSubtabs: document.getElementById('itemsSubtabs'),
+  sortPopover: document.getElementById('sortPopover'),
+  sortOptions: Array.from(document.querySelectorAll('.sort-option')),
+  detailsDrawer: document.getElementById('detailsDrawer'),
+  closeDrawerButton: document.getElementById('closeDrawerButton'),
+  drawerTitle: document.getElementById('drawerTitle'),
+  drawerSubtitle: document.getElementById('drawerSubtitle'),
+  drawerImage: document.getElementById('drawerImage'),
+  drawerDescription: document.getElementById('drawerDescription'),
+  drawerLots: document.getElementById('drawerLots'),
+  minPriceInput: document.getElementById('minPriceInput'),
+  maxPriceInput: document.getElementById('maxPriceInput'),
+  applyLotsFilterButton: document.getElementById('applyLotsFilterButton')
 };
 
 init();
 
 async function init() {
   bindEvents();
+  bindAltEvents();
   await fullRestart();
 }
 
@@ -68,15 +88,73 @@ function bindEvents() {
 
   if (els.refreshButton) {
     els.refreshButton.addEventListener('click', async () => {
+      safeAltEmit('marketplace.init', true);
       await fullRestart();
     });
   }
+
+  if (els.sortMenuButton) {
+    els.sortMenuButton.addEventListener('click', (e) => {
+      e.stopPropagation();
+      els.sortPopover?.classList.toggle('hidden');
+    });
+  }
+
+  els.sortOptions.forEach((button) => {
+    button.addEventListener('click', () => {
+      state.sortMode = button.dataset.sort === 'expensive' ? 'expensive' : 'cheap';
+      updateSortButtons();
+      els.sortPopover?.classList.add('hidden');
+      render();
+    });
+  });
+
+  document.addEventListener('click', (e) => {
+    const target = e.target;
+    if (!(target instanceof Node)) return;
+
+    if (els.sortPopover && !els.sortPopover.contains(target) && target !== els.sortMenuButton) {
+      els.sortPopover.classList.add('hidden');
+    }
+  });
+
+  if (els.closeDrawerButton) {
+    els.closeDrawerButton.addEventListener('click', closeDrawer);
+  }
+
+  if (els.applyLotsFilterButton) {
+    els.applyLotsFilterButton.addEventListener('click', () => {
+      renderDrawerLots();
+    });
+  }
+}
+
+function bindAltEvents() {
+  const altObj = window.alt;
+  if (!altObj || typeof altObj.on !== 'function') return;
+
+  try {
+    altObj.on('marketplace.client.trading.pushLots', (lots) => {
+      const normalized = Array.isArray(lots) ? lots : [];
+      if (!normalized.length) return;
+
+      const itemId = Number(normalized[0]?.itemId);
+      if (!Number.isNaN(itemId)) {
+        state.lotsByItemId.set(itemId, normalized);
+        if (state.selectedItemId === itemId) {
+          renderDrawerLots();
+        }
+      }
+    });
+  } catch {}
 }
 
 async function fullRestart() {
   state.items = [];
   state.itemsMap = new Map();
   state.categoryByItemId = {};
+  state.categoryOrder = [];
+  state.selectedItemId = null;
   state.stats = {
     total: 0,
     processed: 0,
@@ -86,10 +164,17 @@ async function fullRestart() {
     errors: 0
   };
 
-  setStatus('Загрузка...');
+  closeDrawer();
+  setStatus('Загружаю базу данных...');
   render();
 
   await buildFromGlist();
+
+  if (!getFavoriteItems().length) {
+    state.activeTab = 'items';
+  }
+  updateTabs();
+  render();
 }
 
 async function buildFromGlist() {
@@ -97,9 +182,7 @@ async function buildFromGlist() {
   state.parseRunning = true;
 
   try {
-    setStatus('Загрузка glist...');
     const response = await fetch(GLIST_URL);
-
     if (!response.ok) {
       throw new Error(`glist HTTP ${response.status}`);
     }
@@ -108,28 +191,33 @@ async function buildFromGlist() {
     const queue = normalizeGlistToQueue(raw);
 
     state.stats.total = queue.length;
-
     queue.forEach((item) => addOrUpdateItem(item));
+    renderSubtabs();
     render();
 
-    setStatus(`glist загружен. Элементов: ${queue.length}. Загрузка базы...`);
+    setStatus(`Загрузилось ${queue.length} предметов. Читаю сохранённую базу...`);
 
     const dbMap = await preloadSupabaseRows(queue.map((x) => x.itemId));
     hydrateFromDb(dbMap);
 
     render();
-    setStatus(`База подгружена. Поиск отсутствующих названий...`);
 
     const parseQueue = state.items.filter((item) => !item.name || !item.name.trim());
+
+    if (!parseQueue.length) {
+      setStatus(buildStatusText());
+      return;
+    }
+
+    setStatus(`База загружена. Нужно обработать ещё ${parseQueue.length} предметов...`);
+
     await processWithConcurrency(parseQueue, PARSE_CONCURRENCY, async (item) => {
       await enrichSingleItem(item.itemId);
     });
 
-    setStatus(
-      `Готово. Всего: ${state.stats.total} | из базы: ${state.stats.fromDb} | спарсено: ${state.stats.parsed} | сохранено: ${state.stats.saved} | ошибок: ${state.stats.errors}`
-    );
+    setStatus(buildStatusText());
   } catch (error) {
-    setStatus(`Ошибка: ${error.message}`);
+    setStatus(`Не могу получить доступ к базе данных: ${error.message}`);
   } finally {
     state.parseRunning = false;
     render();
@@ -138,10 +226,12 @@ async function buildFromGlist() {
 
 function normalizeGlistToQueue(raw) {
   const map = new Map();
+  const categories = [];
 
   Object.keys(raw || {}).forEach((groupName) => {
-    const ids = Array.isArray(raw[groupName]) ? raw[groupName] : [];
+    categories.push(groupName);
 
+    const ids = Array.isArray(raw[groupName]) ? raw[groupName] : [];
     ids.forEach((itemId) => {
       const id = Number(itemId);
       if (Number.isNaN(id)) return;
@@ -158,12 +248,14 @@ function normalizeGlistToQueue(raw) {
           updatedAt: 0,
           statusText: 'Ожидание',
           parseError: '',
-          debugReason: ''
+          debugReason: '',
+          description: ''
         });
       }
     });
   });
 
+  state.categoryOrder = ['all', ...categories];
   return Array.from(map.values()).sort((a, b) => a.itemId - b.itemId);
 }
 
@@ -178,9 +270,7 @@ async function preloadSupabaseRows(itemIds) {
       .select('item_id, category, name, price, updated_at')
       .in('item_id', batchIds);
 
-    if (error) {
-      continue;
-    }
+    if (error) continue;
 
     for (const row of data || []) {
       result.set(Number(row.item_id), row);
@@ -214,26 +304,24 @@ async function enrichSingleItem(itemId) {
   try {
     item.statusText = 'Парсинг';
     item.parseError = '';
-    item.debugReason = '';
     renderLight();
 
-    const resolvedName = await resolveNameForItem(item);
+    const resolved = await resolveItemMeta(item);
 
-    if (!resolvedName) {
-      item.name = '';
+    if (!resolved?.name) {
       item.statusText = 'Не найдено';
-      item.parseError = item.parseError || 'Название не найдено';
+      item.parseError = resolved?.reason || 'Название не найдено';
       state.stats.errors++;
       state.stats.processed++;
       renderLight();
       return;
     }
 
-    item.name = resolvedName;
+    item.name = resolved.name;
+    item.description = resolved.description || '';
     item.price = normalizePrice(item.price, 1);
     item.updatedAt = Date.now();
     item.statusText = 'Сохранение';
-    item.parseError = '';
     state.stats.parsed++;
     renderLight();
 
@@ -243,6 +331,10 @@ async function enrichSingleItem(itemId) {
     state.stats.saved++;
     state.stats.processed++;
     renderLight();
+
+    if (state.selectedItemId === item.itemId) {
+      openDrawer(item.itemId);
+    }
   } catch (error) {
     item.statusText = 'Ошибка';
     item.parseError = error.message;
@@ -252,11 +344,12 @@ async function enrichSingleItem(itemId) {
   }
 }
 
-async function resolveNameForItem(item) {
+async function resolveItemMeta(item) {
   const { data, error } = await supabase.functions.invoke(FUNCTION_NAME, {
     body: {
       itemId: item.itemId,
-      category: item.category
+      category: item.category,
+      includeDescription: true
     }
   });
 
@@ -264,14 +357,19 @@ async function resolveNameForItem(item) {
     throw new Error(`Edge Function: ${error.message}`);
   }
 
-  item.debugReason = data?.reason || '';
-
-  if (data?.ok && data?.name) {
-    return data.name;
+  if (data?.ok) {
+    return {
+      name: data.name || '',
+      description: data.description || '',
+      reason: ''
+    };
   }
 
-  item.parseError = data?.reason || 'Название не найдено';
-  return '';
+  return {
+    name: '',
+    description: '',
+    reason: data?.reason || 'Название не найдено'
+  };
 }
 
 async function saveItemToSupabase(item) {
@@ -290,17 +388,6 @@ async function saveItemToSupabase(item) {
   if (error) {
     throw new Error(formatSupabaseError(error));
   }
-}
-
-function formatSupabaseError(error) {
-  const parts = [
-    error?.message || '',
-    error?.details || '',
-    error?.hint || '',
-    error?.code || ''
-  ].filter(Boolean);
-
-  return parts.join(' | ');
 }
 
 function addOrUpdateItem(item) {
@@ -323,11 +410,7 @@ async function processWithConcurrency(items, limit, worker) {
     while (index < items.length) {
       const currentIndex = index++;
       const item = items[currentIndex];
-
-      setStatus(
-        `Обработка: ${Math.min(state.stats.processed + state.stats.fromDb + 1, state.stats.total)}/${state.stats.total}`
-      );
-
+      setStatus(`Обработка ${Math.min(state.stats.processed + state.stats.fromDb + 1, state.stats.total)}/${state.stats.total}`);
       await worker(item);
     }
   }
@@ -340,28 +423,28 @@ async function processWithConcurrency(items, limit, worker) {
   await Promise.all(runners);
 }
 
-function normalizePrice(price, fallback = 1) {
-  if (price === '' || price === null || price === undefined) {
-    return fallback;
-  }
+function buildStatusText() {
+  return `Готово. Всего: ${state.stats.total} | из базы: ${state.stats.fromDb} | спарсено: ${state.stats.parsed} | сохранено: ${state.stats.saved} | ошибок: ${state.stats.errors}`;
+}
 
+function formatSupabaseError(error) {
+  const parts = [
+    error?.message || '',
+    error?.details || '',
+    error?.hint || '',
+    error?.code || ''
+  ].filter(Boolean);
+
+  return parts.join(' | ');
+}
+
+function normalizePrice(price, fallback = 1) {
   const num = Number(price);
   return Number.isNaN(num) ? fallback : num;
 }
 
 function buildDefaultImage(itemId) {
   return `https://cdn-eu.majestic-files.net/public/master/static/img/inventory/items/${itemId}.webp`;
-}
-
-function buildPlaceholderImage(itemId) {
-  const svg = `
-    <svg xmlns="http://www.w3.org/2000/svg" width="96" height="96">
-      <rect width="100%" height="100%" rx="12" ry="12" fill="#1d2430"/>
-      <text x="50%" y="46%" text-anchor="middle" dominant-baseline="middle" fill="#8fa3c7" font-family="Arial" font-size="13">Нет фото</text>
-      <text x="50%" y="66%" text-anchor="middle" dominant-baseline="middle" fill="#6e7f9f" font-family="Arial" font-size="12">#${itemId}</text>
-    </svg>
-  `;
-  return `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(svg)}`;
 }
 
 function setStatus(text) {
@@ -375,13 +458,50 @@ function updateTabs() {
     tab.classList.toggle('tab--active', tab.dataset.tab === state.activeTab);
   });
 
-  if (els.favoritesView) {
-    els.favoritesView.classList.toggle('view--active', state.activeTab === 'favorites');
-  }
+  els.favoritesView?.classList.toggle('view--active', state.activeTab === 'favorites');
+  els.itemsView?.classList.toggle('view--active', state.activeTab === 'items');
+  els.itemsSubtabs.style.display = state.activeTab === 'items' ? 'flex' : 'none';
+}
 
-  if (els.libraryView) {
-    els.libraryView.classList.toggle('view--active', state.activeTab === 'library');
-  }
+function renderSubtabs() {
+  if (!els.itemsSubtabs) return;
+
+  const labels = {
+    all: 'Все',
+    ammunition: 'Амуниция',
+    tool: 'Инструменты',
+    misc: 'Разное',
+    auto_parts: 'Автозапчасти',
+    documents: 'Документы',
+    medical: 'Медицина',
+    food: 'Еда',
+    alcohol: 'Алкоголь',
+    fish: 'Рыба',
+    equipment: 'Снаряжение',
+    consumables: 'Расходники',
+    facilities: 'Объекты',
+    books: 'Книги',
+    personals: 'Личное',
+    products: 'Продукты',
+    agriculture: 'Агро',
+    drugs: 'Ингредиенты',
+    armor: 'Броня',
+    others: 'Другое'
+  };
+
+  els.itemsSubtabs.innerHTML = state.categoryOrder.map((category) => {
+    const active = category === state.activeCategory;
+    const text = labels[category] || category;
+    return `<button class="subtab ${active ? 'subtab--active' : ''}" data-category="${escapeHtml(category)}">${escapeHtml(text)}</button>`;
+  }).join('');
+
+  els.itemsSubtabs.querySelectorAll('.subtab').forEach((button) => {
+    button.addEventListener('click', () => {
+      state.activeCategory = button.dataset.category || 'all';
+      renderSubtabs();
+      render();
+    });
+  });
 }
 
 function loadFavorites() {
@@ -396,10 +516,7 @@ function loadFavorites() {
 }
 
 function saveFavorites() {
-  localStorage.setItem(
-    FAVORITES_STORAGE_KEY,
-    JSON.stringify(Array.from(state.favorites))
-  );
+  localStorage.setItem(FAVORITES_STORAGE_KEY, JSON.stringify(Array.from(state.favorites)));
 }
 
 function toggleFavorite(itemId) {
@@ -408,41 +525,54 @@ function toggleFavorite(itemId) {
   } else {
     state.favorites.add(itemId);
   }
-
   saveFavorites();
   render();
 }
 
-function getFilteredItems() {
-  const searchValue = state.search || '';
+function getFavoriteItems() {
+  return state.items.filter((item) => state.favorites.has(item.itemId));
+}
 
-  const bySearch = state.items.filter((item) => {
-    const itemName = (item.name || '').toLowerCase();
-    return itemName.includes(searchValue) || String(item.itemId).includes(searchValue);
+function getItemsForCurrentTab() {
+  const base = state.activeTab === 'favorites'
+    ? getFavoriteItems()
+    : state.items.filter((item) => state.activeCategory === 'all' || item.category === state.activeCategory);
+
+  const filtered = base.filter((item) => {
+    const term = state.search;
+    if (!term) return true;
+    return (item.name || '').toLowerCase().includes(term) || String(item.itemId).includes(term);
   });
 
-  if (state.activeTab === 'favorites') {
-    return bySearch.filter((item) => state.favorites.has(item.itemId));
-  }
+  filtered.sort((a, b) => {
+    if (state.sortMode === 'expensive') {
+      return Number(b.price || 0) - Number(a.price || 0);
+    }
+    return Number(a.price || 0) - Number(b.price || 0);
+  });
 
-  return bySearch;
+  return filtered;
+}
+
+function updateSortButtons() {
+  els.sortOptions.forEach((button) => {
+    const mode = button.dataset.sort === 'expensive' ? 'expensive' : 'cheap';
+    button.classList.toggle('sort-option--active', state.sortMode === mode);
+  });
 }
 
 function render() {
   updateTabs();
+  updateSortButtons();
 
-  const items = getFilteredItems();
+  const items = getItemsForCurrentTab();
 
   if (state.activeTab === 'favorites') {
     renderGrid(els.favoritesGrid, items);
-    if (els.favoritesEmpty) {
-      els.favoritesEmpty.style.display = items.length ? 'none' : 'block';
-    }
+    els.favoritesEmpty.style.display = items.length ? 'none' : 'block';
   } else {
-    renderGrid(els.libraryGrid, items);
-    if (els.libraryEmpty) {
-      els.libraryEmpty.style.display = items.length ? 'none' : 'block';
-    }
+    renderGrid(els.itemsGrid, items);
+    els.itemsEmpty.style.display = items.length ? 'none' : 'block';
   }
 }
 
@@ -450,7 +580,6 @@ let lightRenderQueued = false;
 function renderLight() {
   if (lightRenderQueued) return;
   lightRenderQueued = true;
-
   requestAnimationFrame(() => {
     lightRenderQueued = false;
     render();
@@ -461,57 +590,93 @@ function renderGrid(container, items) {
   if (!container) return;
 
   container.innerHTML = items.map((item) => {
-    const active = state.favorites.has(item.itemId);
-    const itemName = item.name || `Предмет #${item.itemId}`;
-    const fallbackImage = buildPlaceholderImage(item.itemId);
-    const priceText = formatPrice(item.price);
-
-    const shortReason = item.parseError ? item.parseError.slice(0, 80) : '';
-
-    const titleParts = [
-      itemName,
-      item.statusText || '',
-      item.parseError || '',
-      item.debugReason || ''
-    ].filter(Boolean);
-
-    const cardTitle = titleParts.join(' | ');
-
+    const isFavorite = state.favorites.has(item.itemId);
+    const reason = item.parseError ? item.parseError.slice(0, 70) : '';
     return `
-      <div class="item-card" title="${escapeHtml(cardTitle)}">
-        <div class="item-card__price">${escapeHtml(priceText)}</div>
-
-        <button
-          class="item-card__favorite ${active ? 'item-card__favorite--active' : ''}"
-          data-favorite-id="${item.itemId}"
-          title="Добавить в избраное"
-        >★</button>
-
+      <div class="item-card ${isFavorite ? 'item-card--favorite' : ''}" data-card-id="${item.itemId}" title="${escapeHtml(item.name || `Предмет #${item.itemId}`)}">
+        <div class="item-card__price">${escapeHtml(formatPrice(item.price))}</div>
+        <button class="item-card__favorite ${isFavorite ? 'item-card__favorite--active' : ''}" data-favorite-id="${item.itemId}" title="Избраное">★</button>
         <div class="item-card__image-wrap">
-          <img
-            class="item-card__image"
-            src="${escapeHtml(item.image)}"
-            alt="${escapeHtml(itemName)}"
-            loading="lazy"
-            onerror="this.onerror=null;this.src='${escapeHtml(fallbackImage)}';"
-          />
+          <img class="item-card__image" src="${escapeHtml(item.image)}" alt="${escapeHtml(item.name || `Предмет #${item.itemId}`)}" loading="lazy" />
         </div>
-
         <div class="item-card__body">
-          <div class="item-card__name">${escapeHtml(itemName)}</div>
+          <div class="item-card__name">${escapeHtml(item.name || `Предмет #${item.itemId}`)}</div>
           <div class="item-card__meta">${escapeHtml(item.statusText || '')}</div>
-          ${shortReason ? `<div class="item-card__error">${escapeHtml(shortReason)}</div>` : ''}
+          ${reason ? `<div class="item-card__error">${escapeHtml(reason)}</div>` : ''}
         </div>
+        <div class="item-card__id">${item.itemId}</div>
       </div>
     `;
   }).join('');
 
   container.querySelectorAll('[data-favorite-id]').forEach((button) => {
-    button.addEventListener('click', () => {
+    button.addEventListener('click', (e) => {
+      e.stopPropagation();
       const itemId = Number(button.dataset.favoriteId);
       toggleFavorite(itemId);
     });
   });
+
+  container.querySelectorAll('[data-card-id]').forEach((card) => {
+    card.addEventListener('click', () => {
+      const itemId = Number(card.dataset.cardId);
+      openDrawer(itemId);
+    });
+  });
+}
+
+async function openDrawer(itemId) {
+  const item = state.itemsMap.get(itemId);
+  if (!item || !els.detailsDrawer) return;
+
+  state.selectedItemId = itemId;
+  els.detailsDrawer.classList.remove('hidden');
+
+  els.drawerTitle.textContent = item.name || `Предмет #${item.itemId}`;
+  els.drawerSubtitle.textContent = `ID ${item.itemId}`;
+  els.drawerImage.src = item.image;
+  els.drawerDescription.textContent = item.description || 'Нет описания';
+
+  safeAltEmit('marketplace.requestTradePlatformLots', item.itemId, 0, '{"sort":"priceUp"}');
+  renderDrawerLots();
+}
+
+function closeDrawer() {
+  state.selectedItemId = null;
+  els.detailsDrawer?.classList.add('hidden');
+}
+
+function renderDrawerLots() {
+  if (state.selectedItemId == null) return;
+  const item = state.itemsMap.get(state.selectedItemId);
+  if (!item) return;
+
+  const source = state.lotsByItemId.get(item.itemId) || [];
+  const min = Number(els.minPriceInput?.value || '');
+  const max = Number(els.maxPriceInput?.value || '');
+
+  const filtered = source.filter((lot) => {
+    const price = Number(lot.price || 0);
+    if (!Number.isNaN(min) && String(els.minPriceInput?.value || '') !== '' && price < min) return false;
+    if (!Number.isNaN(max) && String(els.maxPriceInput?.value || '') !== '' && price > max) return false;
+    return true;
+  });
+
+  const firstFive = filtered.slice(0, 5);
+
+  els.drawerLots.textContent = firstFive.length
+    ? firstFive.map((lot) => `${lot.id} | ${lot.accountId} ${lot.amount} ${lot.price}`).join('\n')
+    : 'Нет данных';
+
+  els.drawerDescription.textContent = item.description || 'Нет описания';
+}
+
+function safeAltEmit(...args) {
+  const altObj = window.alt;
+  if (!altObj || typeof altObj.emit !== 'function') return;
+  try {
+    altObj.emit(...args);
+  } catch {}
 }
 
 function formatPrice(price) {
