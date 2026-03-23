@@ -4,46 +4,109 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Marketplace Menu</title>
-  <link rel="stylesheet" href="styles.css?v=final1" />
+  <link rel="stylesheet" href="styles.css?v=menu5" />
 </head>
 <body>
   <div class="app">
     <div class="window">
-      <div class="window__header">
-        <div class="window__title">Marketplace Menu</div>
-
-        <div class="window__actions">
-          <input
-            id="searchInput"
-            class="search-input"
-            type="text"
-            placeholder="Поиск по названию или ID..."
-          />
-          <button id="refreshButton" class="action-button">Обновить</button>
+      <header class="window__header">
+        <div class="window__title-wrap">
+          <div class="window__title">Marketplace Menu</div>
+          <div id="statusBar" class="status-bar">Загрузка...</div>
         </div>
-      </div>
+
+        <div class="window__tools">
+          <div class="toolbar-search">
+            <input
+              id="searchInput"
+              class="search-input"
+              type="text"
+              placeholder="Поиск по названию или ID..."
+              autocomplete="off"
+              spellcheck="false"
+            />
+          </div>
+
+          <div class="toolbar-actions">
+            <button id="sortMenuButton" class="icon-button" title="Сортировка" aria-label="Сортировка">
+              <span class="icon-lines"></span>
+            </button>
+
+            <button id="refreshButton" class="icon-button icon-button--refresh" title="Обновить" aria-label="Обновить">
+              <span class="refresh-glyph">↻</span>
+            </button>
+          </div>
+        </div>
+      </header>
 
       <div class="tabs">
         <button class="tab tab--active" data-tab="favorites">Избраное</button>
-        <button class="tab" data-tab="library">Библиотека</button>
+        <button class="tab" data-tab="items">Предметы</button>
       </div>
+
+      <div id="itemsSubtabs" class="subtabs"></div>
 
       <div class="content">
-        <div id="statusBar" class="status-bar">Загрузка...</div>
-
-        <div id="favoritesView" class="view view--active">
+        <section id="favoritesView" class="view view--active">
           <div id="favoritesGrid" class="items-grid"></div>
           <div id="favoritesEmpty" class="empty-state">В избраном пока нет предметов</div>
+        </section>
+
+        <section id="itemsView" class="view">
+          <div id="itemsGrid" class="items-grid"></div>
+          <div id="itemsEmpty" class="empty-state">Список предметов пуст</div>
+        </section>
+      </div>
+
+      <aside id="sortPopover" class="sort-popover hidden">
+        <button class="sort-option" data-sort="cheap">Дешевые</button>
+        <button class="sort-option" data-sort="expensive">Дорогие</button>
+      </aside>
+
+      <aside id="detailsDrawer" class="drawer hidden">
+        <div class="drawer__header">
+          <div class="drawer__title-wrap">
+            <div id="drawerTitle" class="drawer__title">Предмет</div>
+            <div id="drawerSubtitle" class="drawer__subtitle">ID 0</div>
+          </div>
+          <button id="closeDrawerButton" class="icon-button icon-button--small" title="Закрыть">✕</button>
         </div>
 
-        <div id="libraryView" class="view">
-          <div id="libraryGrid" class="items-grid"></div>
-          <div id="libraryEmpty" class="empty-state">Каталог пуст</div>
+        <div class="drawer__body">
+          <div class="drawer__top">
+            <div class="drawer__image-wrap">
+              <img id="drawerImage" class="drawer__image" alt="Предмет" />
+            </div>
+
+            <div class="drawer__filters">
+              <label class="drawer__field">
+                <span>Мин цена</span>
+                <input id="minPriceInput" type="number" min="0" placeholder="0" />
+              </label>
+
+              <label class="drawer__field">
+                <span>Макс цена</span>
+                <input id="maxPriceInput" type="number" min="0" placeholder="0" />
+              </label>
+
+              <button id="applyLotsFilterButton" class="drawer__apply">Применить</button>
+            </div>
+          </div>
+
+          <div class="drawer__section">
+            <div class="drawer__section-title">Описание</div>
+            <div id="drawerDescription" class="drawer__description">Нет описания</div>
+          </div>
+
+          <div class="drawer__section">
+            <div class="drawer__section-title">Последние 5 предложений</div>
+            <div id="drawerLots" class="drawer__lots">Нет данных</div>
+          </div>
         </div>
-      </div>
+      </aside>
     </div>
   </div>
 
-  <script type="module" src="app.js?v=final1"></script>
+  <script type="module" src="app.js?v=menu5"></script>
 </body>
 </html>
