@@ -50,7 +50,7 @@ init();
 
 async function init() {
   bindEvents();
-  await bootstrap();
+  await reloadAll();
 }
 
 function bindEvents() {
@@ -71,12 +71,12 @@ function bindEvents() {
 
   if (els.refreshButton) {
     els.refreshButton.addEventListener('click', async () => {
-      await bootstrap();
+      await reloadAll();
     });
   }
 }
 
-async function bootstrap() {
+async function reloadAll() {
   setStatus('Загрузка glist...');
   const glistItems = await loadGlistItems();
 
@@ -137,13 +137,8 @@ async function loadGlistItems() {
 async function loadFirebaseCatalog() {
   try {
     const response = await fetch(buildDbUrl('catalog'));
-    if (!response.ok) {
-      console.warn('[firebase-read-status]', response.status);
-      return {};
-    }
-
+    if (!response.ok) return {};
     const raw = await response.json();
-    console.log('[firebase-read-success]', raw);
     return raw || {};
   } catch (error) {
     console.warn('[firebase-read-fail]', error);
@@ -190,20 +185,22 @@ async function parseMissingNames() {
   state.parseRunning = true;
 
   try {
-    const missing = state.items.filter((item) => !item.name || !item.name.trim());
+    const queue = state.items.filter((item) => !item.name || !item.name.trim());
 
-    if (!missing.length) {
+    if (!queue.length) {
       setStatus(`Firebase заполнен. Предметов: ${state.items.length}`);
       return;
     }
 
     let success = 0;
     let fail = 0;
+    let writeFail = 0;
+    let batch = [];
 
-    setStatus(`Начинаю парсинг: ${missing.length} предметов`);
+    setStatus(`Начинаю парсинг: ${queue.length} предметов`);
 
-    for (let i = 0; i < missing.length; i++) {
-      const item = missing[i];
+    for (let i = 0; i < queue.length; i++) {
+      const item = queue[i];
 
       try {
         const resolvedName = await resolveNameForItem(item);
@@ -213,9 +210,19 @@ async function parseMissingNames() {
           item.price = normalizePrice(item.price, 1);
           item.updatedAt = Date.now();
 
-          await saveItemToFirebase(item);
-
+          batch.push(makeFirebasePayload(item));
           success++;
+
+          if (batch.length >= 20) {
+            try {
+              await saveBatchToFirebase(batch);
+              batch = [];
+            } catch (e) {
+              console.warn('[firebase-batch-fail]', e);
+              writeFail += batch.length;
+              batch = [];
+            }
+          }
         } else {
           fail++;
         }
@@ -224,19 +231,78 @@ async function parseMissingNames() {
         fail++;
       }
 
-      if ((i + 1) % 5 === 0 || i === missing.length - 1) {
-        setStatus(`Парсинг: ${i + 1}/${missing.length} | найдено: ${success} | без имени: ${fail}`);
+      if ((i + 1) % 5 === 0 || i === queue.length - 1) {
+        setStatus(
+          `Парсинг: ${i + 1}/${queue.length} | найдено: ${success} | без имени: ${fail} | ошибки записи: ${writeFail}`
+        );
         render();
       }
 
-      await delay(35);
+      await delay(60);
     }
 
-    setStatus(`Готово. Найдено: ${success}, без имени: ${fail}, всего: ${state.items.length}`);
+    if (batch.length) {
+      try {
+        await saveBatchToFirebase(batch);
+      } catch (e) {
+        console.warn('[firebase-final-batch-fail]', e);
+        writeFail += batch.length;
+      }
+    }
+
+    setStatus(
+      `Готово. Найдено: ${success}, без имени: ${fail}, ошибки записи: ${writeFail}, всего: ${state.items.length}`
+    );
     render();
   } finally {
     state.parseRunning = false;
   }
+}
+
+function makeFirebasePayload(item) {
+  return {
+    itemId: item.itemId,
+    category: item.category,
+    name: item.name,
+    price: normalizePrice(item.price, 1),
+    updatedAt: Date.now()
+  };
+}
+
+async function saveBatchToFirebase(items) {
+  const payload = {};
+
+  for (const item of items) {
+    payload[item.itemId] = item;
+  }
+
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const response = await fetch(buildDbUrl('catalog'), {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(payload)
+      });
+
+      if (!response.ok) {
+        throw new Error(`firebase batch PATCH HTTP ${response.status}`);
+      }
+
+      const result = await response.json();
+      console.log('[firebase-batch-success]', Object.keys(payload).length, result);
+      return result;
+    } catch (error) {
+      lastError = error;
+      console.warn('[firebase-batch-retry]', attempt, error.message);
+      await delay(400 * attempt);
+    }
+  }
+
+  throw lastError;
 }
 
 async function resolveNameForItem(item) {
@@ -251,12 +317,11 @@ async function resolveNameForItem(item) {
         const name = await fetchNameFromItemPage(url);
 
         if (name) {
-          console.log('[resolve-success]', item.itemId, slug, lang, name);
           item.category = categoryKey;
           return name;
         }
       } catch (error) {
-        console.log('[resolve-try-fail]', item.itemId, slug, lang, error.message);
+        // пробуем следующий URL
       }
     }
   }
@@ -296,36 +361,6 @@ async function fetchNameFromItemPage(url) {
   }
 
   return '';
-}
-
-async function saveItemToFirebase(item) {
-  const payload = {
-    itemId: item.itemId,
-    category: item.category,
-    name: item.name,
-    price: normalizePrice(item.price, 1),
-    updatedAt: Date.now()
-  };
-
-  const url = buildDbUrl(`catalog/${item.itemId}`);
-  console.log('[firebase-save-try]', url, payload);
-
-  const response = await fetch(url, {
-    method: 'PATCH',
-    headers: {
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify(payload)
-  });
-
-  console.log('[firebase-save-status]', item.itemId, response.status);
-
-  if (!response.ok) {
-    throw new Error(`firebase PATCH HTTP ${response.status}`);
-  }
-
-  const result = await response.json();
-  console.log('[firebase-save-success]', item.itemId, result);
 }
 
 function delay(ms) {
