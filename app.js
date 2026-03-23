@@ -8,30 +8,6 @@ const FAVORITES_STORAGE_KEY = 'marketplace_menu_favorites';
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY);
 
-const GROUP_KEY_TO_WIKI_SLUGS = {
-  food: ['food'],
-  tool: ['tools', 'tool'],
-  fish: ['fish'],
-  equipment: ['equipment'],
-  alcohol: ['alcohol'],
-  ammunition: ['ammunition'],
-  medical: ['medicine', 'medical'],
-  auto_parts: ['auto-parts', 'auto_parts'],
-  misc: ['misc'],
-  consumables: ['consumables'],
-  facilities: ['facilities', 'infrastructure'],
-  documents: ['documents'],
-  books: ['books'],
-  personals: ['personal-items', 'personals'],
-  products: ['products'],
-  agriculture: ['agriculture'],
-  drugs: ['ingredients', 'drugs'],
-  armor: ['armor'],
-  others: ['others', 'misc']
-};
-
-const ALL_WIKI_SLUGS = Array.from(new Set(Object.values(GROUP_KEY_TO_WIKI_SLUGS).flat()));
-
 const state = {
   activeTab: 'favorites',
   search: '',
@@ -100,6 +76,7 @@ async function fullRestart() {
   state.categoryByItemId = {};
   setStatus('Старт...');
   render();
+
   log('BOOT', 'Начало полной перезагрузки');
 
   await testSupabaseRead();
@@ -108,7 +85,8 @@ async function fullRestart() {
 
 async function testSupabaseRead() {
   try {
-    log('DB', 'Проверка доступа к Supabase: select 1 row');
+    log('DB', 'Проверка доступа к таблице items_catalog');
+
     const { data, error } = await supabase
       .from('items_catalog')
       .select('item_id, category, name, price, updated_at')
@@ -119,7 +97,10 @@ async function testSupabaseRead() {
       return;
     }
 
-    log('DB', 'Тестовое чтение Supabase успешно', { rows: data?.length || 0, data });
+    log('DB', 'Тестовое чтение Supabase успешно', {
+      rows: data?.length || 0,
+      data
+    });
   } catch (error) {
     logError('DB', 'Критическая ошибка тестового чтения Supabase', error);
   }
@@ -258,7 +239,7 @@ async function enrichSingleItem(itemId, current, total) {
 
     log('DB', 'Запись не найдена в Supabase', { itemId });
 
-    item.statusText = 'Парсинг названия...';
+    item.statusText = 'Вызов Edge Function...';
     render();
 
     const resolvedName = await resolveNameForItem(item);
@@ -266,12 +247,13 @@ async function enrichSingleItem(itemId, current, total) {
     if (!resolvedName) {
       item.name = '';
       item.statusText = 'Имя не найдено';
-      item.parseError = 'Не удалось спарсить название';
+      item.parseError = item.parseError || 'Edge Function не вернула название';
       log('PARSE', 'Название не найдено', {
         itemId,
         category: item.category,
         current,
-        total
+        total,
+        reason: item.parseError
       });
       render();
       return;
@@ -284,7 +266,7 @@ async function enrichSingleItem(itemId, current, total) {
     item.parseError = '';
     render();
 
-    log('PARSE', 'Название спарсено', {
+    log('PARSE', 'Название получено', {
       itemId,
       name: resolvedName,
       category: item.category
@@ -323,87 +305,29 @@ async function loadSingleItemFromSupabase(itemId) {
 }
 
 async function resolveNameForItem(item) {
-  const categoryKey = item.category || state.categoryByItemId[item.itemId] || 'misc';
-  const preferredSlugs = GROUP_KEY_TO_WIKI_SLUGS[categoryKey] || ['misc'];
-  const slugCandidates = [
-    ...preferredSlugs,
-    ...ALL_WIKI_SLUGS.filter((slug) => !preferredSlugs.includes(slug))
-  ];
+  log('PARSE', 'Вызов Edge Function resolve-item-name', {
+    itemId: item.itemId,
+    category: item.category
+  });
 
-  for (const slug of slugCandidates) {
-    for (const lang of ['ru', 'en']) {
-      const url = `https://wiki.majestic-rp.ru/${lang}/items/${slug}/${item.itemId}`;
-
-      log('PARSE', 'Пробую URL', {
-        itemId: item.itemId,
-        originalCategory: categoryKey,
-        slug,
-        lang,
-        url
-      });
-
-      try {
-        const name = await fetchNameFromItemPage(url);
-
-        if (name) {
-          item.category = categoryKey;
-          log('PARSE', 'Успешный парсинг по URL', {
-            itemId: item.itemId,
-            slug,
-            lang,
-            url,
-            name
-          });
-          return name;
-        }
-
-        log('PARSE', 'Пустой результат по URL', {
-          itemId: item.itemId,
-          slug,
-          lang,
-          url
-        });
-      } catch (error) {
-        logError('PARSE', `Ошибка запроса URL для itemId=${item.itemId}`, error, { url });
-      }
+  const { data, error } = await supabase.functions.invoke('resolve-item-name', {
+    body: {
+      itemId: item.itemId,
+      category: item.category
     }
+  });
+
+  if (error) {
+    throw new Error(`Edge Function invoke error: ${error.message}`);
   }
 
-  return '';
-}
+  log('PARSE', 'Ответ Edge Function', data);
 
-async function fetchNameFromItemPage(url) {
-  const response = await fetch(url);
-
-  if (!response.ok) {
-    throw new Error(`Wiki HTTP ${response.status}`);
+  if (data?.ok && data?.name) {
+    return data.name;
   }
 
-  const html = await response.text();
-  const doc = new DOMParser().parseFromString(html, 'text/html');
-
-  const exactH1 = doc.querySelector('h1.yRrGW6a3');
-  if (exactH1) {
-    const value = normalizeText(exactH1.textContent);
-    if (value) return value;
-  }
-
-  const anyH1 = doc.querySelector('h1');
-  if (anyH1) {
-    const value = normalizeText(anyH1.textContent);
-    if (value) return value;
-  }
-
-  const title = doc.querySelector('title');
-  if (title) {
-    const value = normalizeText(title.textContent)
-      .replace(/ · Предмет GTA5 RP · Majestic Вики$/i, '')
-      .replace(/ \| .*$/i, '')
-      .trim();
-
-    if (value) return value;
-  }
-
+  item.parseError = data?.reason || 'Edge Function returned no name';
   return '';
 }
 
