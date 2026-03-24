@@ -8,7 +8,10 @@ const FAVORITES_STORAGE_KEY = 'marketplace_menu_favorites';
 const FUNCTION_NAME = 'rapid-function';
 
 const READ_BATCH_SIZE = 50;
+const WRITE_BATCH_SIZE = 80;
 const PARSE_CONCURRENCY = 3;
+const SYNC_INTERVAL_MS = 15000;
+const LOG_LIMIT = 120;
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY);
 
@@ -25,13 +28,16 @@ const state = {
   categoryOrder: [],
   selectedItemId: null,
   lotsByItemId: new Map(),
+  syncTimer: null,
+  logs: [],
   stats: {
     total: 0,
     processed: 0,
     fromDb: 0,
     parsed: 0,
     saved: 0,
-    errors: 0
+    errors: 0,
+    pricesUpdated: 0
   }
 };
 
@@ -62,9 +68,14 @@ const els = {
   applyLotsFilterButton: document.getElementById('applyLotsFilterButton')
 };
 
+let debugPanel = null;
+let debugBody = null;
+
 init();
 
 async function init() {
+  createDebugPanel();
+  logDebug('BOOT', 'init start');
   bindUiEvents();
   bindBridgeEvents();
   await initialLoad();
@@ -74,6 +85,7 @@ function bindUiEvents() {
   els.tabs.forEach((tab) => {
     tab.addEventListener('click', () => {
       state.activeTab = tab.dataset.tab;
+      logDebug('UI', `tab changed: ${state.activeTab}`);
       updateTabs();
       render();
     });
@@ -87,9 +99,11 @@ function bindUiEvents() {
   }
 
   if (els.refreshButton) {
-    els.refreshButton.addEventListener('click', () => {
-      setStatus('Запросил обновление цен в игре...');
+    els.refreshButton.addEventListener('click', async () => {
+      setStatus('Отправляю запрос обновления в игру...');
+      logDebug('UI', 'refresh click -> ui:marketplace:requestInit');
       emitToClient('ui:marketplace:requestInit');
+      await syncFromSupabase(false);
     });
   }
 
@@ -103,6 +117,7 @@ function bindUiEvents() {
   els.sortOptions.forEach((button) => {
     button.addEventListener('click', () => {
       state.sortMode = button.dataset.sort === 'expensive' ? 'expensive' : 'cheap';
+      logDebug('UI', `sort changed: ${state.sortMode}`);
       updateSortButtons();
       els.sortPopover?.classList.add('hidden');
       render();
@@ -137,25 +152,38 @@ function bindUiEvents() {
 
 function bindBridgeEvents() {
   const altObj = window.alt;
-  if (!altObj || typeof altObj.on !== 'function') return;
+  if (!altObj || typeof altObj.on !== 'function') {
+    logDebug('BRIDGE', 'window.alt not found, standalone web mode');
+    return;
+  }
+
+  logDebug('BRIDGE', 'window.alt found, binding bridge events');
 
   try {
     altObj.on('ui:marketplace:status', (text) => {
       if (typeof text === 'string' && text.trim()) {
         setStatus(text);
+        logDebug('ALT', text);
       }
     });
-  } catch {}
+  } catch (error) {
+    logDebug('BRIDGE', `bind status failed: ${String(error)}`);
+  }
 
   try {
     altObj.on('ui:marketplace:initResult', (...args) => {
+      logDebug('ALT', `initResult received args=${args.length}`);
       applyInitResultPayload(args);
     });
-  } catch {}
+  } catch (error) {
+    logDebug('BRIDGE', `bind initResult failed: ${String(error)}`);
+  }
 
   try {
     altObj.on('ui:marketplace:pushLots', (lots) => {
       const normalized = Array.isArray(lots) ? lots : [];
+      logDebug('ALT', `pushLots received count=${normalized.length}`);
+
       if (!normalized.length) return;
 
       const itemId = Number(normalized[0]?.itemId);
@@ -167,14 +195,19 @@ function bindBridgeEvents() {
         renderDrawerLots();
       }
     });
-  } catch {}
+  } catch (error) {
+    logDebug('BRIDGE', `bind pushLots failed: ${String(error)}`);
+  }
 
   try {
     altObj.on('ui:marketplace:scriptDisabled', () => {
       setStatus('Скрипт отключен клавишей \\ до перезапуска ресурса');
+      logDebug('ALT', 'script disabled event received');
       closeDrawer();
     });
-  } catch {}
+  } catch (error) {
+    logDebug('BRIDGE', `bind scriptDisabled failed: ${String(error)}`);
+  }
 }
 
 async function initialLoad() {
@@ -189,7 +222,8 @@ async function initialLoad() {
     fromDb: 0,
     parsed: 0,
     saved: 0,
-    errors: 0
+    errors: 0,
+    pricesUpdated: 0
   };
 
   closeDrawer();
@@ -204,6 +238,9 @@ async function initialLoad() {
 
   updateTabs();
   render();
+  startSyncTimer();
+
+  logDebug('BOOT', `initial load done items=${state.items.length}`);
 }
 
 async function buildFromGlist() {
@@ -211,6 +248,7 @@ async function buildFromGlist() {
   state.parseRunning = true;
 
   try {
+    logDebug('GLIST', 'fetch start');
     const response = await fetch(GLIST_URL);
     if (!response.ok) {
       throw new Error(`glist HTTP ${response.status}`);
@@ -222,6 +260,7 @@ async function buildFromGlist() {
     state.stats.total = queue.length;
     queue.forEach((item) => addOrUpdateItem(item));
 
+    logDebug('GLIST', `loaded ${queue.length} items`);
     renderSubtabs();
     render();
 
@@ -236,10 +275,12 @@ async function buildFromGlist() {
 
     if (!parseQueue.length) {
       setStatus(buildStatusText());
+      logDebug('META', 'all item names already present');
       return;
     }
 
     setStatus(`База загружена. Нужно обработать ещё ${parseQueue.length} предметов...`);
+    logDebug('META', `need parse ${parseQueue.length} item names`);
 
     await processWithConcurrency(parseQueue, PARSE_CONCURRENCY, async (item) => {
       await enrichSingleItem(item.itemId);
@@ -248,6 +289,7 @@ async function buildFromGlist() {
     setStatus(buildStatusText());
   } catch (error) {
     setStatus(`Не могу получить доступ к базе данных: ${error.message}`);
+    logDebug('ERROR', `buildFromGlist failed: ${error.message}`);
   } finally {
     state.parseRunning = false;
     render();
@@ -300,13 +342,17 @@ async function preloadSupabaseRows(itemIds) {
       .select('item_id, category, name, price, updated_at')
       .in('item_id', batchIds);
 
-    if (error) continue;
+    if (error) {
+      logDebug('DB', `read batch failed start=${i}: ${error.message}`);
+      continue;
+    }
 
     for (const row of data || []) {
       result.set(Number(row.item_id), row);
     }
   }
 
+  logDebug('DB', `preload rows=${result.size}`);
   return result;
 }
 
@@ -324,6 +370,8 @@ function hydrateFromDb(dbMap) {
 
     state.stats.fromDb++;
   }
+
+  logDebug('DB', `hydrate from db count=${state.stats.fromDb}`);
 }
 
 async function enrichSingleItem(itemId) {
@@ -419,11 +467,47 @@ async function saveItemToSupabase(item) {
   }
 }
 
+async function persistMarketPrices(entries) {
+  if (!entries.length) return;
+
+  const rows = [];
+  for (const row of entries) {
+    const itemId = Number(row?.itemId);
+    if (Number.isNaN(itemId)) continue;
+
+    const item = state.itemsMap.get(itemId);
+    if (!item) continue;
+
+    rows.push({
+      item_id: itemId,
+      category: item.category,
+      name: item.name || '',
+      price: normalizePrice(row?.startingBet, item.price || 1),
+      updated_at: new Date().toISOString()
+    });
+  }
+
+  for (let i = 0; i < rows.length; i += WRITE_BATCH_SIZE) {
+    const chunk = rows.slice(i, i + WRITE_BATCH_SIZE);
+    const { error } = await supabase
+      .from('items_catalog')
+      .upsert(chunk, { onConflict: 'item_id' });
+
+    if (error) {
+      logDebug('DB', `persist prices failed: ${error.message}`);
+      return;
+    }
+  }
+
+  logDebug('DB', `persist prices success count=${rows.length}`);
+}
+
 function applyInitResultPayload(args) {
   const entries = extractMarketplaceItems(args);
 
   if (!entries.length) {
     setStatus('Сработал подпись такая: marketplace.client.initResult, но список предметов пуст');
+    logDebug('ALT', 'initResult no market entries');
     return;
   }
 
@@ -445,8 +529,13 @@ function applyInitResultPayload(args) {
     updated++;
   }
 
+  state.stats.pricesUpdated += updated;
+
   setStatus(`Сработал подпись такая: marketplace.client.initResult | обновлено предметов: ${updated}`);
+  logDebug('ALT', `initResult updated=${updated}`);
   renderLight();
+
+  persistMarketPrices(entries);
 
   if (state.selectedItemId != null) {
     const current = state.itemsMap.get(state.selectedItemId);
@@ -501,6 +590,70 @@ async function processWithConcurrency(items, limit, worker) {
   }
 
   await Promise.all(runners);
+}
+
+function startSyncTimer() {
+  stopSyncTimer();
+  state.syncTimer = window.setInterval(() => {
+    syncFromSupabase(false);
+  }, SYNC_INTERVAL_MS);
+  logDebug('SYNC', `timer started ${SYNC_INTERVAL_MS}ms`);
+}
+
+function stopSyncTimer() {
+  if (state.syncTimer) {
+    clearInterval(state.syncTimer);
+    state.syncTimer = null;
+  }
+}
+
+async function syncFromSupabase(showStatus = false) {
+  if (!state.items.length) return;
+
+  if (showStatus) {
+    setStatus('Синхронизация данных из Supabase...');
+  }
+
+  let changed = 0;
+
+  for (let i = 0; i < state.items.length; i += READ_BATCH_SIZE) {
+    const batchIds = state.items.slice(i, i + READ_BATCH_SIZE).map((x) => x.itemId);
+
+    const { data, error } = await supabase
+      .from('items_catalog')
+      .select('item_id, category, name, price, updated_at')
+      .in('item_id', batchIds);
+
+    if (error) {
+      logDebug('SYNC', `batch sync failed: ${error.message}`);
+      continue;
+    }
+
+    for (const row of data || []) {
+      const item = state.itemsMap.get(Number(row.item_id));
+      if (!item) continue;
+
+      const newPrice = normalizePrice(row.price, item.price);
+      const newName = row.name || item.name;
+      const updatedAt = row.updated_at ? new Date(row.updated_at).getTime() : item.updatedAt;
+
+      if (item.price !== newPrice || item.name !== newName || item.updatedAt !== updatedAt) {
+        item.price = newPrice;
+        item.name = newName;
+        item.updatedAt = updatedAt;
+        changed++;
+      }
+    }
+  }
+
+  if (changed > 0) {
+    logDebug('SYNC', `supabase changed items=${changed}`);
+    renderLight();
+  }
+
+  if (showStatus) {
+    setStatus(`Синхронизация завершена. Изменено: ${changed}`);
+  }
 }
 
 function buildStatusText() {
@@ -650,6 +803,8 @@ function render() {
 
   const items = getItemsForCurrentTab();
 
+  logDebug('RENDER', `tab=${state.activeTab} items=${items.length} total=${state.items.length} category=${state.activeCategory}`);
+
   if (state.activeTab === 'favorites') {
     renderGrid(els.favoritesGrid, items);
     if (els.favoritesEmpty) {
@@ -674,7 +829,10 @@ function renderLight() {
 }
 
 function renderGrid(container, items) {
-  if (!container) return;
+  if (!container) {
+    logDebug('RENDER', 'renderGrid skipped: container not found');
+    return;
+  }
 
   container.innerHTML = items.map((item) => {
     const isFavorite = state.favorites.has(item.itemId);
@@ -769,10 +927,16 @@ function emitRequestLots(itemId) {
 
 function emitToClient(...args) {
   const altObj = window.alt;
-  if (!altObj || typeof altObj.emit !== 'function') return;
+  if (!altObj || typeof altObj.emit !== 'function') {
+    logDebug('BRIDGE', `emit skipped no alt: ${String(args[0])}`);
+    return;
+  }
+
   try {
     altObj.emit(...args);
-  } catch {}
+  } catch (error) {
+    logDebug('BRIDGE', `emit failed ${String(args[0])}: ${String(error)}`);
+  }
 }
 
 function formatPrice(price) {
@@ -788,4 +952,102 @@ function escapeHtml(value) {
     .replaceAll('>', '&gt;')
     .replaceAll('"', '&quot;')
     .replaceAll("'", '&#039;');
+}
+
+function createDebugPanel() {
+  if (document.getElementById('marketplace-debug-panel')) return;
+
+  const style = document.createElement('style');
+  style.textContent = `
+    #marketplace-debug-panel {
+      position: absolute;
+      left: 12px;
+      bottom: 12px;
+      width: 360px;
+      max-height: 180px;
+      overflow: hidden;
+      border-radius: 12px;
+      background: rgba(10, 14, 22, 0.92);
+      border: 1px solid rgba(255,255,255,0.08);
+      z-index: 40;
+      font-family: Consolas, monospace;
+      font-size: 11px;
+      color: #d8e0f0;
+      box-shadow: 0 10px 24px rgba(0,0,0,0.28);
+    }
+    #marketplace-debug-panel .dbg-head {
+      padding: 8px 10px;
+      border-bottom: 1px solid rgba(255,255,255,0.08);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    #marketplace-debug-panel .dbg-title {
+      font-weight: 700;
+      color: #fff;
+    }
+    #marketplace-debug-panel .dbg-toggle {
+      border: none;
+      background: rgba(255,255,255,0.08);
+      color: #fff;
+      border-radius: 6px;
+      width: 24px;
+      height: 22px;
+      cursor: pointer;
+    }
+    #marketplace-debug-panel .dbg-body {
+      max-height: 145px;
+      overflow: auto;
+      padding: 6px 8px 8px;
+      white-space: pre-wrap;
+    }
+    #marketplace-debug-panel .dbg-line {
+      margin-bottom: 4px;
+      color: rgba(255,255,255,0.82);
+    }
+    #marketplace-debug-panel .dbg-line span {
+      color: #8fb4ff;
+    }
+  `;
+  document.head.appendChild(style);
+
+  debugPanel = document.createElement('div');
+  debugPanel.id = 'marketplace-debug-panel';
+  debugPanel.innerHTML = `
+    <div class="dbg-head">
+      <div class="dbg-title">Debug menu</div>
+      <button class="dbg-toggle">–</button>
+    </div>
+    <div class="dbg-body"></div>
+  `;
+  document.body.appendChild(debugPanel);
+
+  debugBody = debugPanel.querySelector('.dbg-body');
+  const toggle = debugPanel.querySelector('.dbg-toggle');
+  toggle.addEventListener('click', () => {
+    const hidden = debugBody.style.display === 'none';
+    debugBody.style.display = hidden ? 'block' : 'none';
+    toggle.textContent = hidden ? '–' : '+';
+  });
+}
+
+function logDebug(stage, message) {
+  const time = new Date().toLocaleTimeString('ru-RU');
+  state.logs.push(`[${time}] [${stage}] ${message}`);
+  if (state.logs.length > LOG_LIMIT) {
+    state.logs.shift();
+  }
+  if (debugBody) {
+    debugBody.innerHTML = state.logs.slice().reverse().map((line) => {
+      const first = line.indexOf(']');
+      const second = line.indexOf(']', first + 1);
+      if (first !== -1 && second !== -1) {
+        const a = line.slice(0, second + 1);
+        const b = line.slice(second + 1).trim();
+        return `<div class="dbg-line"><span>${escapeHtml(a)}</span> ${escapeHtml(b)}</div>`;
+      }
+      return `<div class="dbg-line">${escapeHtml(line)}</div>`;
+    }).join('');
+  }
+  console.log(`[marketplace-debug][${stage}] ${message}`);
 }
