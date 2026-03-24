@@ -65,12 +65,12 @@ const els = {
 init();
 
 async function init() {
-  bindEvents();
-  bindAltBridge();
+  bindUiEvents();
+  bindBridgeEvents();
   await initialLoad();
 }
 
-function bindEvents() {
+function bindUiEvents() {
   els.tabs.forEach((tab) => {
     tab.addEventListener('click', () => {
       state.activeTab = tab.dataset.tab;
@@ -88,8 +88,8 @@ function bindEvents() {
 
   if (els.refreshButton) {
     els.refreshButton.addEventListener('click', () => {
-      setStatus('Запросил обновление цен...');
-      emitToClient('ui:marketplace:init');
+      setStatus('Запросил обновление цен в игре...');
+      emitToClient('ui:marketplace:requestInit');
     });
   }
 
@@ -113,10 +113,10 @@ function bindEvents() {
     const target = e.target;
     if (!(target instanceof Node)) return;
 
-    const clickedInsideSortButton = els.sortMenuButton?.contains(target);
-    const clickedInsidePopover = els.sortPopover?.contains(target);
+    const insideSortButton = els.sortMenuButton?.contains(target);
+    const insidePopover = els.sortPopover?.contains(target);
 
-    if (!clickedInsideSortButton && !clickedInsidePopover) {
+    if (!insideSortButton && !insidePopover) {
       els.sortPopover?.classList.add('hidden');
     }
   });
@@ -135,9 +135,23 @@ function bindEvents() {
   }
 }
 
-function bindAltBridge() {
+function bindBridgeEvents() {
   const altObj = window.alt;
   if (!altObj || typeof altObj.on !== 'function') return;
+
+  try {
+    altObj.on('ui:marketplace:status', (text) => {
+      if (typeof text === 'string' && text.trim()) {
+        setStatus(text);
+      }
+    });
+  } catch {}
+
+  try {
+    altObj.on('ui:marketplace:initResult', (...args) => {
+      applyInitResultPayload(args);
+    });
+  } catch {}
 
   try {
     altObj.on('ui:marketplace:pushLots', (lots) => {
@@ -145,18 +159,13 @@ function bindAltBridge() {
       if (!normalized.length) return;
 
       const itemId = Number(normalized[0]?.itemId);
-      if (!Number.isNaN(itemId)) {
-        state.lotsByItemId.set(itemId, normalized);
-        if (state.selectedItemId === itemId) {
-          renderDrawerLots();
-        }
-      }
-    });
-  } catch {}
+      if (Number.isNaN(itemId)) return;
 
-  try {
-    altObj.on('ui:marketplace:initResult', (payload) => {
-      applyInitResultPayload(payload);
+      state.lotsByItemId.set(itemId, normalized);
+
+      if (state.selectedItemId === itemId) {
+        renderDrawerLots();
+      }
     });
   } catch {}
 
@@ -195,8 +204,6 @@ async function initialLoad() {
 
   updateTabs();
   render();
-
-  emitToClient('ui:marketplace:init');
 }
 
 async function buildFromGlist() {
@@ -355,7 +362,7 @@ async function enrichSingleItem(itemId) {
     renderLight();
 
     if (state.selectedItemId === item.itemId) {
-      openDrawer(item.itemId);
+      syncDrawer(item);
     }
   } catch (error) {
     item.statusText = 'Ошибка';
@@ -412,11 +419,11 @@ async function saveItemToSupabase(item) {
   }
 }
 
-function applyInitResultPayload(payload) {
-  const entries = extractMarketplaceItems(payload);
+function applyInitResultPayload(args) {
+  const entries = extractMarketplaceItems(args);
 
   if (!entries.length) {
-    setStatus('marketplace.client.initResult пришел, но список предметов пуст');
+    setStatus('Сработал подпись такая: marketplace.client.initResult, но список предметов пуст');
     return;
   }
 
@@ -429,43 +436,38 @@ function applyInitResultPayload(payload) {
     const item = state.itemsMap.get(itemId);
     if (!item) continue;
 
-    const startingBet = normalizePrice(row?.startingBet, item.price || 1);
-    const totalQuantity = Number(row?.totalQuantity || 0);
+    item.price = normalizePrice(row?.startingBet, item.price || 1);
 
-    item.price = startingBet;
+    const totalQuantity = Number(row?.totalQuantity || 0);
     item.totalQuantity = Number.isNaN(totalQuantity) ? 0 : totalQuantity;
     item.statusText = item.totalQuantity > 0 ? `Лотов: ${item.totalQuantity}` : 'Нет лотов';
 
     updated++;
   }
 
-  setStatus(`Обновил цены через marketplace.client.initResult: ${updated} предметов`);
+  setStatus(`Сработал подпись такая: marketplace.client.initResult | обновлено предметов: ${updated}`);
   renderLight();
 
   if (state.selectedItemId != null) {
     const current = state.itemsMap.get(state.selectedItemId);
     if (current) {
-      openDrawer(current.itemId);
+      syncDrawer(current);
     }
   }
 }
 
-function extractMarketplaceItems(payload) {
-  if (Array.isArray(payload)) {
-    if (payload.length >= 3 && Array.isArray(payload[2])) {
-      return payload[2];
-    }
+function extractMarketplaceItems(args) {
+  if (!Array.isArray(args)) return [];
 
-    const firstObjectArray = payload.find(
-      (part) => Array.isArray(part) && part.some((x) => x && typeof x === 'object' && 'itemId' in x)
-    );
-
-    if (Array.isArray(firstObjectArray)) {
-      return firstObjectArray;
-    }
+  if (args.length >= 3 && Array.isArray(args[2])) {
+    return args[2];
   }
 
-  return [];
+  const directArray = args.find(
+    (part) => Array.isArray(part) && part.some((x) => x && typeof x === 'object' && 'itemId' in x)
+  );
+
+  return Array.isArray(directArray) ? directArray : [];
 }
 
 function addOrUpdateItem(item) {
@@ -538,6 +540,7 @@ function updateTabs() {
 
   els.favoritesView?.classList.toggle('view--active', state.activeTab === 'favorites');
   els.itemsView?.classList.toggle('view--active', state.activeTab === 'items');
+
   if (els.itemsSubtabs) {
     els.itemsSubtabs.style.display = state.activeTab === 'items' ? 'flex' : 'none';
   }
@@ -649,10 +652,14 @@ function render() {
 
   if (state.activeTab === 'favorites') {
     renderGrid(els.favoritesGrid, items);
-    els.favoritesEmpty.style.display = items.length ? 'none' : 'block';
+    if (els.favoritesEmpty) {
+      els.favoritesEmpty.style.display = items.length ? 'none' : 'block';
+    }
   } else {
     renderGrid(els.itemsGrid, items);
-    els.itemsEmpty.style.display = items.length ? 'none' : 'block';
+    if (els.itemsEmpty) {
+      els.itemsEmpty.style.display = items.length ? 'none' : 'block';
+    }
   }
 }
 
@@ -712,13 +719,16 @@ async function openDrawer(itemId) {
   state.selectedItemId = itemId;
   els.detailsDrawer.classList.remove('hidden');
 
+  syncDrawer(item);
+  emitRequestLots(item.itemId);
+  renderDrawerLots();
+}
+
+function syncDrawer(item) {
   els.drawerTitle.textContent = item.name || `Предмет #${item.itemId}`;
   els.drawerSubtitle.textContent = `ID ${item.itemId}`;
   els.drawerImage.src = item.image;
   els.drawerDescription.textContent = item.description || 'Нет описания';
-
-  emitRequestLots(item.itemId);
-  renderDrawerLots();
 }
 
 function closeDrawer() {
@@ -754,8 +764,7 @@ function renderDrawerLots() {
 }
 
 function emitRequestLots(itemId) {
-  const sortPayload = '{"sort":"priceUp"}';
-  emitToClient('ui:marketplace:requestLots', itemId, 0, sortPayload);
+  emitToClient('ui:marketplace:requestLots', itemId, 0, '{"sort":"priceUp"}');
 }
 
 function emitToClient(...args) {
