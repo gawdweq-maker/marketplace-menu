@@ -66,8 +66,8 @@ init();
 
 async function init() {
   bindEvents();
-  bindAltEvents();
-  await fullRestart();
+  bindAltBridge();
+  await initialLoad();
 }
 
 function bindEvents() {
@@ -87,9 +87,9 @@ function bindEvents() {
   }
 
   if (els.refreshButton) {
-    els.refreshButton.addEventListener('click', async () => {
+    els.refreshButton.addEventListener('click', () => {
+      setStatus('Запросил обновление цен...');
       emitToClient('ui:marketplace:init');
-      await fullRestart();
     });
   }
 
@@ -135,7 +135,7 @@ function bindEvents() {
   }
 }
 
-function bindAltEvents() {
+function bindAltBridge() {
   const altObj = window.alt;
   if (!altObj || typeof altObj.on !== 'function') return;
 
@@ -153,9 +153,22 @@ function bindAltEvents() {
       }
     });
   } catch {}
+
+  try {
+    altObj.on('ui:marketplace:initResult', (payload) => {
+      applyInitResultPayload(payload);
+    });
+  } catch {}
+
+  try {
+    altObj.on('ui:marketplace:scriptDisabled', () => {
+      setStatus('Скрипт отключен клавишей \\ до перезапуска ресурса');
+      closeDrawer();
+    });
+  } catch {}
 }
 
-async function fullRestart() {
+async function initialLoad() {
   state.items = [];
   state.itemsMap = new Map();
   state.categoryByItemId = {};
@@ -182,6 +195,8 @@ async function fullRestart() {
 
   updateTabs();
   render();
+
+  emitToClient('ui:marketplace:init');
 }
 
 async function buildFromGlist() {
@@ -252,11 +267,11 @@ function normalizeGlistToQueue(raw) {
           category: groupName,
           name: '',
           price: 1,
+          totalQuantity: 0,
           image: buildDefaultImage(id),
           updatedAt: 0,
           statusText: 'Ожидание',
           parseError: '',
-          debugReason: '',
           description: ''
         });
       }
@@ -299,7 +314,6 @@ function hydrateFromDb(dbMap) {
     item.updatedAt = row.updated_at ? new Date(row.updated_at).getTime() : item.updatedAt;
     item.statusText = 'Из базы';
     item.parseError = '';
-    item.debugReason = '';
 
     state.stats.fromDb++;
   }
@@ -396,6 +410,62 @@ async function saveItemToSupabase(item) {
   if (error) {
     throw new Error(formatSupabaseError(error));
   }
+}
+
+function applyInitResultPayload(payload) {
+  const entries = extractMarketplaceItems(payload);
+
+  if (!entries.length) {
+    setStatus('marketplace.client.initResult пришел, но список предметов пуст');
+    return;
+  }
+
+  let updated = 0;
+
+  for (const row of entries) {
+    const itemId = Number(row?.itemId);
+    if (Number.isNaN(itemId)) continue;
+
+    const item = state.itemsMap.get(itemId);
+    if (!item) continue;
+
+    const startingBet = normalizePrice(row?.startingBet, item.price || 1);
+    const totalQuantity = Number(row?.totalQuantity || 0);
+
+    item.price = startingBet;
+    item.totalQuantity = Number.isNaN(totalQuantity) ? 0 : totalQuantity;
+    item.statusText = item.totalQuantity > 0 ? `Лотов: ${item.totalQuantity}` : 'Нет лотов';
+
+    updated++;
+  }
+
+  setStatus(`Обновил цены через marketplace.client.initResult: ${updated} предметов`);
+  renderLight();
+
+  if (state.selectedItemId != null) {
+    const current = state.itemsMap.get(state.selectedItemId);
+    if (current) {
+      openDrawer(current.itemId);
+    }
+  }
+}
+
+function extractMarketplaceItems(payload) {
+  if (Array.isArray(payload)) {
+    if (payload.length >= 3 && Array.isArray(payload[2])) {
+      return payload[2];
+    }
+
+    const firstObjectArray = payload.find(
+      (part) => Array.isArray(part) && part.some((x) => x && typeof x === 'object' && 'itemId' in x)
+    );
+
+    if (Array.isArray(firstObjectArray)) {
+      return firstObjectArray;
+    }
+  }
+
+  return [];
 }
 
 function addOrUpdateItem(item) {
